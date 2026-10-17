@@ -1,0 +1,37 @@
+{
+  "name": "curvealpha",
+  "version": "5.0.0",
+  "description": "CurveAlpha V5: capital survival and selectivity engine for pump.fun bonding curves. Paper trading by default.",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "engines": { "node": ">=22.13" },
+  "bin": { "curvealpha": "dist/cli.js" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && cp -r src/dashboard/public dist/dashboard/",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:rust": "cargo test --manifest-path crates/curve-core/Cargo.toml",
+    "vectors": "tsx scripts/gen-vectors.ts",
+    "start": "tsx src/cli.ts run",
+    "cli": "tsx src/cli.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.1",
+    "@pump-fun/pump-sdk": "4.1.0",
+    "@pump-fun/pump-swap-sdk": "2.1.0",
+    "@solana/spl-token": "^0.4.13",
+    "@solana/web3.js": "^1.98.2",
+    "@triton-one/yellowstone-grpc": "9.0.0",
+    "bn.js": "^5.2.2",
+    "bs58": "^6.0.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.6",
+    "@types/node": "^22.15.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  }
+}

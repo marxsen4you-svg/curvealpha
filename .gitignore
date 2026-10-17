@@ -1,0 +1,10 @@
+node_modules/
+dist/
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+crates/**/target/
+.env
+keys/
+*.keypair.json

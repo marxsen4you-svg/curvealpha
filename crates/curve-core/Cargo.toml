@@ -1,0 +1,11 @@
+[package]
+name = "curve-core"
+version = "5.0.0"
+edition = "2021"
+description = "Exact pump.fun bonding curve arithmetic for CurveAlpha (u128, no floats, no dependencies)"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
