@@ -109,6 +109,9 @@ export const ParamsSchema = z
       tipCeilingFracOfEdge: z.number().min(0.5).max(0.7),
       minTipLamports: int.min(1000),
       paperLatencyMs: int,
+      /** Compute limits charged to paper trades (live trades measure by simulation). */
+      paperBuyCuLimit: int.max(1_400_000),
+      paperSellCuLimit: int.max(1_400_000),
       bundleTimeoutMs: int.min(1000),
       maxBuyRetries: int.max(3),
       useBam: z.boolean(),
@@ -222,6 +225,8 @@ export const DEFAULT_PARAMS: Params = {
     tipCeilingFracOfEdge: 0.6,
     minTipLamports: 1000,
     paperLatencyMs: 400,
+    paperBuyCuLimit: 160_000,
+    paperSellCuLimit: 130_000,
     bundleTimeoutMs: 8000,
     maxBuyRetries: 1,
     useBam: false,

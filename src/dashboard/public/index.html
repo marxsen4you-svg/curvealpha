@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="curvealpha-token" content="__CURVEALPHA_TOKEN__">
+<title>CurveAlpha Console</title>
+<style>
+  :root {
+    --bg: #0d0f12; --panel: #14171c; --line: #232832; --ink: #e6e9ef; --dim: #8a93a3; --faint: #5a6270;
+    --good: #4fd18b; --bad: #ff6b6b; --warn: #f5b84b; --accent: #7aa8ff; --halt: #c75bff;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.45 var(--sans); }
+  header { display: flex; flex-wrap: wrap; gap: 18px; align-items: center; padding: 14px 20px; border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 2; }
+  h1 { font-size: 15px; margin: 0; letter-spacing: .02em; font-weight: 650; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .12em; color: var(--dim); margin: 0 0 10px; font-weight: 600; }
+  .pill { font: 600 11px var(--mono); padding: 3px 9px; border-radius: 99px; border: 1px solid currentColor; }
+  .stat { display: flex; flex-direction: column; }
+  .stat b { font: 600 15px var(--mono); }
+  .stat span { font-size: 10px; color: var(--dim); text-transform: uppercase; letter-spacing: .1em; }
+  main { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; padding: 16px 20px 40px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; min-width: 0; }
+  .c4 { grid-column: span 4; } .c5 { grid-column: span 5; } .c7 { grid-column: span 7; } .c8 { grid-column: span 8; } .c6 { grid-column: span 6; } .c12 { grid-column: span 12; }
+  @media (max-width: 1100px) { .c4, .c5, .c6, .c7, .c8 { grid-column: span 12; } }
+  table { width: 100%; border-collapse: collapse; font: 12px var(--mono); }
+  th { text-align: left; color: var(--faint); font-weight: 500; padding: 4px 6px; border-bottom: 1px solid var(--line); }
+  td { padding: 4px 6px; border-bottom: 1px solid #1a1e25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 3px 14px; font: 12px var(--mono); }
+  .kv div:nth-child(odd) { color: var(--dim); font-family: var(--sans); }
+  .good { color: var(--good); } .bad { color: var(--bad); } .warn { color: var(--warn); } .dim { color: var(--dim); }
+  .bar { position: relative; height: 8px; background: #1c2129; border-radius: 4px; min-width: 120px; }
+  .bar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; background: var(--accent); }
+  .bar u { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--warn); }
+  svg { width: 100%; display: block; }
+  textarea { width: 100%; min-height: 300px; background: #0f1216; color: var(--ink); border: 1px solid var(--line); border-radius: 8px; font: 12px var(--mono); padding: 10px; }
+  button { background: #1f2630; color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 6px 12px; font: 600 12px var(--sans); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .note { color: var(--faint); font-size: 11px; margin-top: 8px; }
+  .scroll { max-height: 360px; overflow: auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CurveAlpha V5</h1>
+  <span id="mode" class="pill">PAPER</span>
+  <span id="survival" class="pill">NORMAL</span>
+  <div class="stat"><b id="equity">n/a</b><span>Equity SOL</span></div>
+  <div class="stat"><b id="dd">n/a</b><span>Drawdown</span></div>
+  <div class="stat"><b id="day">n/a</b><span>Today</span></div>
+  <div class="stat"><b id="th">n/a</b><span>Alpha threshold</span></div>
+  <div class="stat"><b id="open">n/a</b><span>Open</span></div>
+  <div class="stat"><b id="conn">n/a</b><span>Stream</span></div>
+</header>
+<main>
+  <section class="c8"><h2>Equity, last 7 days</h2><svg id="eq" viewBox="0 0 800 220" preserveAspectRatio="none"></svg><div class="note" id="eqnote"></div></section>
+  <section class="c4"><h2>Capital survival</h2><div class="kv" id="surv"></div>
+    <div style="margin-top:12px"><button id="clearHalt">Clear halt</button></div>
+    <div class="note">A halt from the daily loss breaker lifts by itself after the configured hours. A bankroll floor halt only lifts here, after you review why.</div></section>
+
+  <section class="c7"><h2>Alpha feed</h2><div class="scroll"><table id="feed"><thead><tr><th>time</th><th>token</th><th>h</th><th>score</th><th></th><th>decision</th></tr></thead><tbody></tbody></table></div></section>
+  <section class="c5"><h2>Infrastructure</h2><div class="kv" id="infra"></div><h2 style="margin-top:14px">Jito landed tips, lamports</h2><svg id="tips" viewBox="0 0 400 110" preserveAspectRatio="none"></svg></section>
+
+  <section class="c12"><h2>Open positions</h2><table id="pos"><thead><tr><th>token</th><th>score</th><th>stake</th><th>value now</th><th>multiple</th><th>realized</th><th>rungs</th><th>age</th><th>fixed costs</th></tr></thead><tbody></tbody></table>
+    <h2 style="margin-top:16px">Recently closed</h2><table id="closed"><thead><tr><th>token</th><th>net P&amp;L SOL</th><th>exit</th></tr></thead><tbody></tbody></table></section>
+
+  <section class="c6"><h2>Factor evidence (shadow ledger)</h2><table id="attr"><thead><tr><th>factor</th><th>coverage</th><th>rank corr.</th><th>top third</th><th>bottom third</th><th>realized P&amp;L SOL</th></tr></thead><tbody></tbody></table><div class="note" id="attrnote"></div></section>
+  <section class="c6"><h2>Threshold sweep</h2><table id="sweep"><thead><tr><th>threshold</th><th>selected</th><th>mean multiple</th><th>hit 2x</th><th>log growth / trade</th></tr></thead><tbody></tbody></table></section>
+
+  <section class="c12"><h2>Parameters (hot reload)</h2>
+    <textarea id="params" spellcheck="false"></textarea>
+    <div style="display:flex;gap:10px;align-items:center;margin-top:8px"><button id="apply">Validate and apply</button><span id="pmsg" class="dim"></span></div>
+    <div class="note">Every accepted or rejected edit is written to the parameter audit trail with a full diff. Invalid parameters are rejected and the previous set stays in force.</div>
+  </section>
+</main>
+<script>
+const TOKEN = document.querySelector('meta[name="curvealpha-token"]').content;
+const $ = (id) => document.getElementById(id);
+const f = (x, d = 4) => (x === null || x === undefined || Number.isNaN(x)) ? "n/a" : Number(x).toFixed(d);
+const pct = (x, d = 1) => (x === null || x === undefined) ? "n/a" : (x * 100).toFixed(d) + "%";
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const modeColor = { NORMAL: "var(--good)", CAUTION: "var(--warn)", SURVIVAL: "var(--bad)", HALTED: "var(--halt)" };
+let paramsLoaded = -1;
+
+function line(svg, series, w, h, colors, digits = 4) {
+  const all = series.flat().map((p) => p[1]).filter(Number.isFinite);
+  if (all.length < 2) { svg.innerHTML = `<text x="10" y="20" fill="#5a6270" font-size="12">waiting for data</text>`; return; }
+  const xs = series.flat().map((p) => p[0]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs), y0 = Math.min(...all), y1 = Math.max(...all);
+  const sx = (x) => ((x - x0) / Math.max(1, x1 - x0)) * (w - 10) + 5;
+  const sy = (y) => h - 8 - ((y - y0) / Math.max(1e-12, y1 - y0)) * (h - 20);
+  svg.innerHTML = series.map((s, i) => `<polyline fill="none" stroke="${colors[i]}" stroke-width="1.6" points="${s.map((p) => `${sx(p[0])},${sy(p[1])}`).join(" ")}"/>`).join("")
+    + `<text x="6" y="12" fill="#8a93a3" font-size="10">${f(y1, digits)}</text><text x="6" y="${h - 2}" fill="#8a93a3" font-size="10">${f(y0, digits)}</text>`;
+}
+
+function render(s) {
+  const sv = s.survival;
+  $("mode").textContent = s.settings.mode.toUpperCase();
+  $("mode").style.color = s.settings.mode === "live" ? "var(--bad)" : "var(--accent)";
+  $("survival").textContent = sv.mode;
+  $("survival").style.color = modeColor[sv.mode];
+  $("equity").textContent = f(sv.equityLamports / 1e9, 4);
+  $("dd").textContent = pct(sv.drawdownPct);
+  $("day").textContent = pct(sv.dayPnlPct, 2);
+  $("day").className = sv.dayPnlPct >= 0 ? "good" : "bad";
+  $("th").textContent = f(s.threshold.threshold, 1);
+  $("open").textContent = sv.openPositions;
+  $("conn").textContent = s.ingest ? (s.ingest.connected ? "live" : "reconnecting") : "off";
+  $("conn").className = s.ingest && s.ingest.connected ? "good" : "bad";
+
+  line($("eq"), [s.equity], 800, 220, ["var(--accent)"]);
+  $("eqnote").textContent = s.equity.length ? `${s.equity.length} marks. Equity is cash plus the exact liquidation value of open positions after fees and price impact.` : "";
+
+  const t = s.threshold;
+  $("surv").innerHTML = [
+    ["Peak equity", f(sv.peakEquityLamports / 1e9)], ["Day start", f(sv.dayStartEquityLamports / 1e9)],
+    ["Risk opened today", f(sv.riskOpenedTodayLamports / 1e9) + " SOL"],
+    ["Threshold parts", `${f(t.thresholdBase, 0)} base + ${f(t.thresholdSurvivalAdd, 1)} mode + ${f(t.thresholdDrawdownAdd, 1)} drawdown + ${f(t.thresholdBankrollAdd, 1)} bankroll`],
+    ["Halted until", sv.haltedUntilMs ? (sv.haltedUntilMs > 8e15 ? "operator review" : new Date(sv.haltedUntilMs).toLocaleString()) : "not halted"],
+    ["Halt reason", sv.haltReason ?? "none"],
+    ["Candidates", `${s.counters.candidates} seen, ${s.counters.approved} approved, ${s.counters.refused} refused`],
+  ].map(([k, v]) => `<div>${k}</div><div>${esc(v)}</div>`).join("");
+
+  const ing = s.ingest;
+  const tf = s.tipFloor;
+  $("infra").innerHTML = [
+    ["Last slot", ing ? ing.lastSlot : "n/a"], ["Reconnects", ing ? ing.reconnects : "n/a"], ["Replay gaps", ing ? ing.gaps.length : "n/a"],
+    ["Tx received", ing ? ing.txReceived : s.counters.txs], ["Queue depth", `${s.queue.depth} (+${s.queue.priorityDepth} priority)`],
+    ["Dropped", s.queue.dropped], ["Tokens tracked", s.tokensTracked], ["Shadows open", s.shadowsOpen],
+    ["Corpus curves", s.corpus], ["Ranked wallets", s.smartWallets],
+    ["Score latency p50 / p95", `${f(s.scoreLatencyMs.p50, 1)} / ${f(s.scoreLatencyMs.p95, 1)} ms`],
+    ["Curve fee tier 0", s.feeTiers[0] ? `${s.feeTiers[0].protocolFeeBps} + ${s.feeTiers[0].creatorFeeBps} bps` : "n/a"],
+    ["Tip p50 / p75 / p95", tf ? `${tf.p50} / ${tf.p75} / ${tf.p95}` : "no data"],
+  ].map(([k, v]) => `<div>${k}</div><div>${esc(v)}</div>`).join("");
+  const th = s.tipHistory;
+  line($("tips"), [th.map((r) => [r.t, r.p50]), th.map((r) => [r.t, r.p75]), th.map((r) => [r.t, r.ema50])], 400, 110, ["var(--accent)", "var(--warn)", "var(--good)"], 0);
+
+  $("feed").tBodies[0].innerHTML = s.feed.map((r) => {
+    const sc = r.score === null ? null : r.score;
+    const bar = sc === null ? `<span class="dim">${esc(r.vetoed ?? "")}</span>` : `<div class="bar"><i style="width:${sc}%"></i><u style="left:${Math.min(100, r.threshold)}%"></u></div>`;
+    const cls = r.approved ? "good" : r.decision ? "warn" : "dim";
+    return `<tr><td>${new Date(r.tMs).toLocaleTimeString()}</td><td title="${esc(r.mint)}">${esc(r.symbol)}</td><td>${r.horizon}s</td><td>${sc === null ? "" : f(sc, 1)}</td><td>${bar}</td><td class="${cls}">${esc(r.decision ?? "")}</td></tr>`;
+  }).join("");
+
+  $("pos").tBodies[0].innerHTML = s.positions.length ? s.positions.map((p) => `<tr><td title="${esc(p.mint)}">${esc(p.symbol)}</td><td>${f(p.score, 1)}</td><td>${f(p.stakeSol)}</td><td>${f(p.valueSol)}</td><td class="${p.multiple >= 1 ? "good" : "bad"}">${f(p.multiple, 3)}</td><td>${f(p.realizedSol)}</td><td>${p.rungs.map((x) => (x ? "●" : "○")).join("")}</td><td>${f(p.ageSec, 0)}s</td><td>${f(p.fixedCostSol, 5)}</td></tr>`).join("") : `<tr><td colspan="9" class="dim">no open positions</td></tr>`;
+  $("closed").tBodies[0].innerHTML = s.closed.map((p) => `<tr><td title="${esc(p.mint)}">${esc(p.symbol)}</td><td class="${p.pnlSol >= 0 ? "good" : "bad"}">${f(p.pnlSol, 5)}</td><td>${esc(p.reason)}</td></tr>`).join("");
+
+  const ev = s.evaluation;
+  if (ev) {
+    const pnl = Object.fromEntries(ev.pnlAttribution.map((x) => [x.factor, x.pnlSol]));
+    $("attr").tBodies[0].innerHTML = ev.attribution.map((a) => `<tr><td>${a.factor}</td><td>${pct(a.coverage, 0)}</td><td class="${(a.spearman ?? 0) > 0 ? "good" : "bad"}">${f(a.spearman, 3)}</td><td>${f(a.topTercileMean, 3)}</td><td>${f(a.bottomTercileMean, 3)}</td><td>${f(pnl[a.factor], 5)}</td></tr>`).join("");
+    $("attrnote").textContent = `${ev.samples} closed shadow outcomes over ${ev.windowDays} days. Rank correlation is between the factor value and the log of the realized multiple. Realized P&L is split by each factor's share of the entry score, an accounting convention, not proof of cause.`;
+    $("sweep").tBodies[0].innerHTML = ev.thresholds.map((r) => `<tr><td>${r.threshold}</td><td>${r.selected}</td><td>${f(r.meanMultiple, 3)}</td><td>${pct(r.hitRate2x)}</td><td>${f(r.growthPerTrade, 6)}</td></tr>`).join("");
+  }
+
+  if (paramsLoaded !== s.paramsVersion && document.activeElement !== $("params")) {
+    $("params").value = JSON.stringify(s.params, null, 2);
+    paramsLoaded = s.paramsVersion;
+  }
+}
+
+const es = new EventSource("/api/events");
+es.onmessage = (m) => render(JSON.parse(m.data));
+
+$("apply").onclick = async () => {
+  let body;
+  try { body = JSON.parse($("params").value); } catch (e) { $("pmsg").textContent = "Not valid JSON: " + e.message; $("pmsg").className = "bad"; return; }
+  const r = await fetch("/api/params", { method: "POST", headers: { "content-type": "application/json", "x-curvealpha-token": TOKEN }, body: JSON.stringify(body) });
+  const j = await r.json();
+  $("pmsg").textContent = j.ok ? "Applied. Takes effect on the next decision." : "Rejected: " + j.error;
+  $("pmsg").className = j.ok ? "good" : "bad";
+  paramsLoaded = -1;
+};
+$("clearHalt").onclick = async () => {
+  if (!confirm("Clear the halt and allow trading again?")) return;
+  await fetch("/api/halt/clear", { method: "POST", headers: { "x-curvealpha-token": TOKEN } });
+};
+</script>
+</body>
+</html>

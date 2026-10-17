@@ -282,7 +282,7 @@ export class CapitalSurvivalEngine {
     const g = growth(inp, stake);
     trace.growthAtStake = g;
     if (!(g > 0)) {
-      return refuse(`growth: at the capped stake of ${(stake / 1e9).toFixed(4)} SOL fixed costs make the log growth negative`);
+      return refuse(`growth: at the capped stake of ${stake} lamports, fixed costs make the log growth negative`);
     }
     const evLower = bootstrapEvLower(inp, stake, p.risk.kellyBootstrapSamples, p.risk.evBootstrapQuantile, c.seed);
     const minEdge = p.risk.minEdgePct * stake;
