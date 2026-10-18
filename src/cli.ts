@@ -30,6 +30,7 @@ import { evaluate } from "./meta/evaluate.js";
 import { replayDecision } from "./meta/replay.js";
 import { systemClock } from "./util/clock.js";
 import { viabilityTable } from "./risk/viability.js";
+import { installFaultHandlers } from "./util/faults.js";
 
 const args = process.argv.slice(2);
 const cmd = args[0] ?? "run";
@@ -134,6 +135,18 @@ async function run(): Promise<void> {
     },
   );
   engine.onPressure = (pause) => ingest.setPaused(pause);
+  installFaultHandlers({
+    proc: process,
+    halt: (reason) => engine.survival.halt(reason),
+    record: (m) => store.logDecision(Date.now(), null, "fault", null, m, {}),
+    flush: () => {
+      if (paper) store.kvSet("paper_cash", paper.cash.toString());
+      store.kvSet(`survival:${settings.mode}`, JSON.stringify(engine.survivalSnapshot()));
+      store.flush();
+    },
+    exit: (code) => process.exit(code),
+    log: (m, e) => console.error(`FAULT: ${m}`, e),
+  });
   void ingest.start();
   void engine.run();
 

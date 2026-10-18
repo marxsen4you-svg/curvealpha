@@ -14,6 +14,7 @@ import { DatabaseSync, type StatementSync } from "node:sqlite";
 const SCHEMA = `
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
+PRAGMA busy_timeout = 5000;
 
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
@@ -153,6 +154,9 @@ export class Store {
   private pending: Array<() => void> = [];
   private timer: NodeJS.Timeout | null = null;
   private stmts = new Map<string, StatementSync>();
+  /** Deferred writes that failed (each is skipped; the rest of its batch commits). */
+  writeErrors = 0;
+  lastWriteError: string | null = null;
 
   constructor(path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
@@ -190,14 +194,36 @@ export class Store {
     if (this.pending.length === 0) return;
     const batch = this.pending;
     this.pending = [];
-    this.db.exec("BEGIN");
+    // flush runs from a timer: it must never throw, and one bad write must not take its batch with it
     try {
-      for (const f of batch) f();
+      this.db.exec("BEGIN");
+    } catch (e) {
+      this.noteWriteError(e, batch.length);
+      return;
+    }
+    for (const f of batch) {
+      try {
+        f();
+      } catch (e) {
+        this.noteWriteError(e, 1);
+      }
+    }
+    try {
       this.db.exec("COMMIT");
     } catch (e) {
-      this.db.exec("ROLLBACK");
-      throw e;
+      this.noteWriteError(e, batch.length);
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        /* nothing left to roll back */
+      }
     }
+  }
+
+  private noteWriteError(e: unknown, count: number): void {
+    this.writeErrors += count;
+    this.lastWriteError = e instanceof Error ? e.message : String(e);
+    console.error(`store: ${count} deferred write(s) failed: ${this.lastWriteError}`);
   }
 
   kvGet(key: string): string | undefined {

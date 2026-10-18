@@ -234,7 +234,7 @@ export class Engine {
     }
     if (alpha.score >= p.scoring.shadowMinScore) {
       const values = Object.fromEntries(Object.entries(alpha.factors).map(([k, f]) => [k, f.value]));
-      void this.shadows.openShadow(rec, alpha.score, horizon, { values, contributions: alpha.contributions });
+      void this.shadows.openShadow(rec, alpha.score, horizon, { values, contributions: alpha.contributions }).catch((e) => console.error("shadow open failed", e));
     }
     if (alpha.score >= threshold && !this.positions.holds(rec.mint)) {
       this.counters.candidates++;

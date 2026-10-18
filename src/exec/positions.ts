@@ -41,6 +41,17 @@ export interface OpenRequest {
   decisionId: number;
 }
 
+const failedFill = (error: string): Fill => ({
+  ok: false,
+  error,
+  lamports: 0n,
+  tokens: 0n,
+  curveFeesLamports: 0n,
+  networkLamports: 0n,
+  tipLamports: 0n,
+  rentLamports: 0n,
+});
+
 export class PositionManager {
   readonly positions = new Map<number, Position>();
   readonly closed: Position[] = [];
@@ -81,13 +92,22 @@ export class PositionManager {
       return null;
     }
     const minTokens = (quote.tokens * BigInt(10_000 - p.execution.slippageBps)) / 10_000n;
-    const fill = await this.exec.buy({
-      mint: req.rec.mint,
-      tokenProgram: req.rec.tokenProgram,
-      budgetLamports: req.stakeLamports,
-      minTokensOut: minTokens,
-      tipLamports: req.tipLamports,
-    });
+    let fill: Fill;
+    try {
+      fill = await this.exec.buy({
+        mint: req.rec.mint,
+        tokenProgram: req.rec.tokenProgram,
+        budgetLamports: req.stakeLamports,
+        minTokensOut: minTokens,
+        tipLamports: req.tipLamports,
+      });
+    } catch (e) {
+      // the order's outcome is unknown (a live buy may have landed): open nothing more until someone looks
+      const msg = e instanceof Error ? e.message : String(e);
+      this.log("execution", req.rec.mint, false, `execution fault during buy: ${msg}`, { side: "buy", minTokens, decisionId: req.decisionId, error: msg });
+      this.survival.halt(`execution fault during buy of ${req.rec.mint}: ${msg}. Check the wallet for this mint, then clear the halt.`);
+      return null;
+    }
     const execId = this.log("execution", req.rec.mint, fill.ok, fill.ok ? "buy filled" : `buy failed: ${fill.error}`, {
       side: "buy",
       quoteTokens: quote.tokens,
@@ -177,24 +197,12 @@ export class PositionManager {
     if (tip < BigInt(p.execution.minTipLamports)) tip = BigInt(p.execution.minTipLamports);
 
     let fill: Fill;
-    let sold: bigint;
-    if (action.kind === "burnClose") {
-      sold = pos.state.remainingTokens;
-      fill = await this.exec.burnClose(pos.mint, pos.tokenProgram, sold, tip);
-    } else {
-      sold = action.tokens > pos.state.remainingTokens ? pos.state.remainingTokens : action.tokens;
-      const last = sold >= pos.state.remainingTokens;
-      const quote = rec && !rec.curve.complete ? sellSolFromTokens(c.global, c.schedule, rec.curve.tokenTotalSupply, rec.curve, sold) : 0n;
-      const minOut = quote > 0n ? (quote * BigInt(10_000 - p.execution.slippageBps)) / 10_000n : 0n;
-      fill = await this.exec.sell({
-        mint: pos.mint,
-        tokenProgram: pos.tokenProgram,
-        tokens: sold,
-        minSolOut: emergency ? 0n : minOut,
-        tipLamports: tip,
-        venue: action.venue,
-        closeAccount: last,
-      });
+    let sold = 0n;
+    try {
+      ({ fill, sold } = await this.submitExit(pos, action, tip, emergency));
+    } catch (e) {
+      // treated as a failed attempt: logged below and retried on the next update, tip escalating
+      fill = failedFill(`fault: ${e instanceof Error ? e.message : String(e)}`);
     }
     this.log("exit", pos.mint, fill.ok, `${action.reason}${fill.ok ? "" : ` (failed: ${fill.error})`}`, {
       positionId: pos.id,
@@ -222,6 +230,30 @@ export class PositionManager {
         ),
       );
     }
+  }
+
+  private async submitExit(pos: Position, action: ExitAction, tip: bigint, emergency: boolean): Promise<{ fill: Fill; sold: bigint }> {
+    if (action.kind === "burnClose") {
+      const sold = pos.state.remainingTokens;
+      return { fill: await this.exec.burnClose(pos.mint, pos.tokenProgram, sold, tip), sold };
+    }
+    const p = this.params();
+    const c = this.ctx();
+    const rec = this.token(pos.mint);
+    const sold = action.tokens > pos.state.remainingTokens ? pos.state.remainingTokens : action.tokens;
+    const last = sold >= pos.state.remainingTokens;
+    const quote = rec && !rec.curve.complete ? sellSolFromTokens(c.global, c.schedule, rec.curve.tokenTotalSupply, rec.curve, sold) : 0n;
+    const minOut = quote > 0n ? (quote * BigInt(10_000 - p.execution.slippageBps)) / 10_000n : 0n;
+    const fill = await this.exec.sell({
+      mint: pos.mint,
+      tokenProgram: pos.tokenProgram,
+      tokens: sold,
+      minSolOut: emergency ? 0n : minOut,
+      tipLamports: tip,
+      venue: action.venue,
+      closeAccount: last,
+    });
+    return { fill, sold };
   }
 
   private close(pos: Position, reason: string): void {

@@ -174,6 +174,12 @@ export class CapitalSurvivalEngine {
     this.reservations.delete(reservationId);
   }
 
+  /** Stop new entries until an operator clears it (an engine fault, an unresolved order). Exits continue. */
+  halt(reason: string, untilMs = Number.MAX_SAFE_INTEGER): void {
+    this.haltedUntil = untilMs;
+    this.haltReason = reason;
+  }
+
   /** Operator action: clear a halt (the reason and time stay in the audit log). */
   clearHalt(): void {
     this.haltedUntil = null;
