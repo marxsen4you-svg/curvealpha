@@ -5,7 +5,12 @@
  * It binds to 127.0.0.1 only. Because any web page in the operator's browser
  * can send requests to localhost, every state-changing request must carry a
  * per-process token in a custom header (which cross-origin pages cannot set
- * without a CORS preflight this server never approves) and a matching Origin.
+ * without a CORS preflight this server never approves) and a loopback Origin.
+ *
+ * Every request must also name a loopback Host. Without that check a DNS
+ * rebinding page (attacker.example re-pointed at 127.0.0.1) is same-origin
+ * with the dashboard in the browser: it could read the page, take the token
+ * and send matching Host and Origin headers.
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
@@ -102,10 +107,13 @@ export function startDashboard(d: DashboardDeps): { url: string; close: () => vo
     };
   };
 
+  // the port is not part of the check: an SSH tunnel may map the dashboard to any local port
+  const LOOPBACK = /^(127\.0\.0\.1|localhost|\[::1\])(:\d{1,5})?$/;
+  const hostAllowed = (req: IncomingMessage) => LOOPBACK.test((req.headers.host ?? "").toLowerCase());
   const authorized = (req: IncomingMessage) => {
-    const host = req.headers.host ?? "";
-    const origin = req.headers.origin;
-    return req.headers["x-curvealpha-token"] === token && (!origin || origin === `http://${host}`);
+    const origin = req.headers.origin?.toLowerCase();
+    const originOk = !origin || (origin.startsWith("http://") && LOOPBACK.test(origin.slice("http://".length)));
+    return req.headers["x-curvealpha-token"] === token && originOk;
   };
 
   const body = (req: IncomingMessage): Promise<string> =>
@@ -119,18 +127,27 @@ export function startDashboard(d: DashboardDeps): { url: string; close: () => vo
       req.on("error", rej);
     });
 
+  const SECURITY_HEADERS = {
+    "cache-control": "no-store",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "referrer-policy": "no-referrer",
+    "content-security-policy":
+      "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+  };
   const send = (res: ServerResponse, code: number, payload: string, type = "application/json") => {
-    res.writeHead(code, { "content-type": type, "cache-control": "no-store", "x-content-type-options": "nosniff" });
+    res.writeHead(code, { "content-type": type, ...SECURITY_HEADERS });
     res.end(payload);
   };
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
+    if (!hostAllowed(req)) return send(res, 421, json({ error: "the dashboard answers loopback host names only" }));
     try {
       if (req.method === "GET" && url.pathname === "/") return send(res, 200, html, "text/html; charset=utf-8");
       if (req.method === "GET" && url.pathname === "/api/state") return send(res, 200, json(state()));
       if (req.method === "GET" && url.pathname === "/api/events") {
-        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-store", connection: "keep-alive" });
+        res.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/event-stream", connection: "keep-alive" });
         const push = () => res.write(`data: ${json(state())}\n\n`);
         push();
         const t = setInterval(push, 1000);
@@ -138,7 +155,8 @@ export function startDashboard(d: DashboardDeps): { url: string; close: () => vo
         return;
       }
       if (req.method === "GET" && url.pathname === "/api/decisions") {
-        const limit = Math.min(500, Number(url.searchParams.get("limit") ?? 100));
+        const asked = Math.floor(Number(url.searchParams.get("limit") ?? 100));
+        const limit = Number.isFinite(asked) && asked > 0 ? Math.min(500, asked) : 100;
         return send(res, 200, json(d.store.all("SELECT id, ts_ms, mint, kind, approved, summary FROM decisions ORDER BY id DESC LIMIT ?", limit)));
       }
       if (req.method === "POST" && url.pathname === "/api/params") {

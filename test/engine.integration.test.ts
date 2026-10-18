@@ -51,6 +51,13 @@ describe("engine integration on a synthetic market", () => {
       expect(p.stake_lamports).toBeLessThanOrEqual(Math.ceil(params.risk.maxRiskPerTradePct * 3.5e9));
     }
 
+    // never more positions open at once than the concurrency limit
+    const spans = store.all<{ opened_ms: number; closed_ms: number | null }>("SELECT opened_ms, closed_ms FROM positions");
+    for (const s of spans) {
+      const overlapping = spans.filter((o) => o.opened_ms <= s.opened_ms && (o.closed_ms === null || o.closed_ms > s.opened_ms)).length;
+      expect(overlapping).toBeLessThanOrEqual(params.risk.maxConcurrentPositions);
+    }
+
     // scoring stays inside its deadline
     const lat = [...engine.scoreLatency].sort((a, b) => a - b);
     expect(lat[Math.floor(lat.length * 0.99)]!).toBeLessThan(params.scoring.scoreDeadlineMs);

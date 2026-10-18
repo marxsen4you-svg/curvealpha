@@ -41,6 +41,9 @@ export function replayDecision(store: Store, id: number): ReplayResult {
   return { id, mint: row.mint, identical: differences.length === 0, original, replayed, differences };
 }
 
+/** Fields that identify a live order rather than describe the decision; a replay cannot reproduce them. */
+const IGNORED = new Set(["reservationId"]);
+
 function diff(a: unknown, b: unknown, path = ""): string[] {
   // JSON stores non-finite numbers as null
   if ((a === null && typeof b === "number" && !Number.isFinite(b)) || (b === null && typeof a === "number" && !Number.isFinite(a))) return [];
@@ -48,7 +51,7 @@ function diff(a: unknown, b: unknown, path = ""): string[] {
     return Object.is(a, b) || (Number.isNaN(a) && Number.isNaN(b)) ? [] : [`${path}: ${a} != ${b}`];
   }
   if (a && b && typeof a === "object" && typeof b === "object") {
-    const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+    const keys = new Set([...Object.keys(a), ...Object.keys(b)].filter((k) => !IGNORED.has(k)));
     return [...keys].flatMap((k) => diff((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k], path ? `${path}.${k}` : k));
   }
   return JSON.stringify(a) === JSON.stringify(b) ? [] : [`${path}: ${JSON.stringify(a)} != ${JSON.stringify(b)}`];

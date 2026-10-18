@@ -65,13 +65,14 @@ export class TipOracle {
     private url = TIP_FLOOR_URL,
     private fetchFn: typeof fetch = fetch,
     private onUpdate: (f: TipFloor) => void = () => undefined,
+    private now: () => number = Date.now,
   ) {}
 
   async refresh(): Promise<TipFloor | null> {
     try {
       const res = await this.fetchFn(this.url, { signal: AbortSignal.timeout(4000) });
       if (!res.ok) return this.floor;
-      const f = parseTipFloor(await res.json(), Date.now());
+      const f = parseTipFloor(await res.json(), this.now());
       if (f) {
         this.floor = f;
         this.history.push(f);

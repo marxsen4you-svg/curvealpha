@@ -37,6 +37,10 @@ export interface SurvivalSnapshot {
   haltedUntilMs: number | null;
   haltReason: string | null;
   openPositions: number;
+  /** Approved orders not yet filled or failed (transient; never restored after a restart). */
+  pendingPositions?: number;
+  pendingRiskLamports?: number;
+  pendingCashLamports?: number;
 }
 
 export interface Candidate {
@@ -77,6 +81,8 @@ export interface SizingTrace {
 
 export interface Decision {
   approved: boolean;
+  /** Set on approval: the reservation holding this order's slot, risk and cash until commit() or release(). */
+  reservationId?: number;
   stakeLamports: number;
   /** Max tip the execution layer may pay: ceiling fraction of the residual edge. */
   tipBudgetLamports: number;
@@ -96,6 +102,11 @@ export class CapitalSurvivalEngine {
   private haltedUntil: number | null = null;
   private haltReason: string | null = null;
   private openPositions = 0;
+  /** Approved orders in flight: each holds a concurrency slot, its risk and its cash. */
+  private reservations = new Map<number, { riskLamports: number; cashLamports: number }>();
+  private nextReservation = 1;
+  /** Pending totals carried by a replayed snapshot (a replay has no live reservations). */
+  private replayPending = { positions: 0, risk: 0, cash: 0 };
 
   constructor(
     private params: () => Params,
@@ -142,6 +153,27 @@ export class CapitalSurvivalEngine {
     this.riskOpenedToday += stakeLamports * this.params().risk.lossGivenAdverse;
   }
 
+  private pending(): { positions: number; risk: number; cash: number } {
+    let risk = this.replayPending.risk;
+    let cash = this.replayPending.cash;
+    for (const r of this.reservations.values()) {
+      risk += r.riskLamports;
+      cash += r.cashLamports;
+    }
+    return { positions: this.reservations.size + this.replayPending.positions, risk, cash };
+  }
+
+  /** The order filled: its risk is now spent for the day. The caller updates the open count. */
+  commit(reservationId: number, filledStakeLamports: number): void {
+    if (!this.reservations.delete(reservationId)) return;
+    this.recordOpen(filledStakeLamports);
+  }
+
+  /** The order failed or was refused after approval: give back its slot, risk and cash. */
+  release(reservationId: number): void {
+    this.reservations.delete(reservationId);
+  }
+
   /** Operator action: clear a halt (the reason and time stay in the audit log). */
   clearHalt(): void {
     this.haltedUntil = null;
@@ -179,6 +211,9 @@ export class CapitalSurvivalEngine {
       haltedUntilMs: this.haltedUntil,
       haltReason: this.haltReason,
       openPositions: this.openPositions,
+      pendingPositions: this.pending().positions,
+      pendingRiskLamports: this.pending().risk,
+      pendingCashLamports: this.pending().cash,
     };
   }
 
@@ -220,8 +255,9 @@ export class CapitalSurvivalEngine {
     const survivalMultiplier = mode === "SURVIVAL" ? p.risk.survivalSizeMult : mode === "CAUTION" ? p.risk.cautionSizeMult : 1;
     const riskCapStake = (p.risk.maxRiskPerTradePct * this.equity) / p.risk.lossGivenAdverse;
     const positionCapStake = p.risk.maxPositionPct * this.equity;
+    const pend = this.pending();
     const dailyBudgetStake =
-      Math.max(0, p.risk.dailyRiskBudgetPct * this.dayStart - this.riskOpenedToday) / p.risk.lossGivenAdverse;
+      Math.max(0, p.risk.dailyRiskBudgetPct * this.dayStart - this.riskOpenedToday - pend.risk) / p.risk.lossGivenAdverse;
     const trace: SizingTrace = {
       ...th,
       sampleSize: c.outcomes.length,
@@ -247,8 +283,8 @@ export class CapitalSurvivalEngine {
     });
 
     if (mode === "HALTED") return refuse(`halted: ${this.haltReason}`);
-    if (this.openPositions >= p.risk.maxConcurrentPositions) {
-      return refuse(`concurrency: ${this.openPositions} open, limit ${p.risk.maxConcurrentPositions}`);
+    if (this.openPositions + pend.positions >= p.risk.maxConcurrentPositions) {
+      return refuse(`concurrency: ${this.openPositions} open + ${pend.positions} pending, limit ${p.risk.maxConcurrentPositions}`);
     }
     if (c.alphaScore < th.threshold) {
       return refuse(`alpha ${c.alphaScore.toFixed(1)} below threshold ${th.threshold.toFixed(1)}`);
@@ -294,14 +330,18 @@ export class CapitalSurvivalEngine {
       );
     }
     const required = stake + c.entryFixedLamports + c.ataRentLamports;
-    if (required > c.spendableLamports) {
-      return refuse(`funds: need ${(required / 1e9).toFixed(4)} SOL, have ${(c.spendableLamports / 1e9).toFixed(4)}`);
+    const spendable = c.spendableLamports - pend.cash;
+    if (required > spendable) {
+      return refuse(`funds: need ${(required / 1e9).toFixed(4)} SOL, have ${(spendable / 1e9).toFixed(4)}${pend.cash > 0 ? " after pending orders" : ""}`);
     }
     // residual edge after every fee except the entry tip; the tip may take at most the ceiling share of it
     const residualEdge = evLower + c.entryTipLamports;
     const tipBudget = Math.max(0, Math.floor(p.execution.tipCeilingFracOfEdge * residualEdge));
+    const reservationId = this.nextReservation++;
+    this.reservations.set(reservationId, { riskLamports: stake * p.risk.lossGivenAdverse, cashLamports: required });
     return {
       approved: true,
+      reservationId,
       stakeLamports: stake,
       tipBudgetLamports: tipBudget,
       reasons: ["approved"],
@@ -314,6 +354,7 @@ export class CapitalSurvivalEngine {
   static replay(params: Params, snapshot: SurvivalSnapshot, candidate: Candidate, nowMs: number): Decision {
     const e = new CapitalSurvivalEngine(() => params, snapshot.equityLamports, nowMs);
     e.restore(snapshot);
+    e.replayPending = { positions: snapshot.pendingPositions ?? 0, risk: snapshot.pendingRiskLamports ?? 0, cash: snapshot.pendingCashLamports ?? 0 };
     return e.decide(candidate, nowMs);
   }
 }

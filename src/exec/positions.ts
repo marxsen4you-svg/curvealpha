@@ -134,7 +134,6 @@ export class PositionManager {
       closeReason: null,
     };
     this.positions.set(id, pos);
-    this.survival.recordOpen(Number(fill.lamports));
     this.survival.setOpenPositions(this.positions.size);
     return pos;
   }

@@ -275,14 +275,21 @@ export class Engine {
       seed: (now ^ this.seedCounter++) >>> 0,
     };
     let decision: Decision = this.survival.decide(candidate, now);
+    const refuseAfterApproval = (reason: string) => {
+      if (decision.reservationId !== undefined) this.survival.release(decision.reservationId);
+      decision = { ...decision, approved: false, reservationId: undefined, reasons: [reason] };
+    };
     // without live tip data the fixed costs are unknown, so nothing is approved, in paper mode too
     if (decision.approved && (entryTip.refused || exitTip.refused)) {
-      decision = { ...decision, approved: false, reasons: [`tips: ${entryTip.refused ? entryTip.reason : exitTip.reason}`] };
+      refuseAfterApproval(`tips: ${entryTip.refused ? entryTip.reason : exitTip.reason}`);
+    } else if (decision.approved && this.d.tips.isStale(now)) {
+      const age = this.d.tips.floor ? Math.round((now - this.d.tips.floor.atMs) / 1000) : null;
+      refuseAfterApproval(`tips: tip floor is stale (${age === null ? "never fetched" : `${age} s old`}), fixed costs unknown`);
     }
     let tipCheck = null;
     if (decision.approved) {
       tipCheck = chooseTip(this.d.tips.floor, p.execution.tipPercentile, minTip, BigInt(decision.tipBudgetLamports));
-      if (tipCheck.refused) decision = { ...decision, approved: false, reasons: [`tip: ${tipCheck.reason}`] };
+      if (tipCheck.refused) refuseAfterApproval(`tip: ${tipCheck.reason}`);
     }
     const decisionId = this.d.store.logDecision(now, rec.mint, "size", decision.approved, decision.reasons[0] ?? "", {
       alpha,
@@ -296,14 +303,18 @@ export class Engine {
     });
     if (decision.approved) {
       this.counters.approved++;
-      void this.positions.open({
-        rec,
-        stakeLamports: BigInt(decision.stakeLamports),
-        tipLamports: tipCheck!.tipLamports,
-        score: alpha.score!,
-        horizon: alpha.horizonSec,
-        decisionId,
-      });
+      const reservationId = decision.reservationId!;
+      void this.positions
+        .open({
+          rec,
+          stakeLamports: BigInt(decision.stakeLamports),
+          tipLamports: tipCheck!.tipLamports,
+          score: alpha.score!,
+          horizon: alpha.horizonSec,
+          decisionId,
+        })
+        .then((pos) => (pos ? this.survival.commit(reservationId, Number(pos.state.stakeLamports)) : this.survival.release(reservationId)))
+        .catch(() => this.survival.release(reservationId));
     } else this.counters.refused++;
     return decision;
   }

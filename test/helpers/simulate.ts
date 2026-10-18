@@ -7,7 +7,7 @@ import { Engine } from "../../src/engine.js";
 import { Store } from "../../src/store/db.js";
 import { resolveParams } from "../../src/config/params.js";
 import { loadSettings } from "../../src/config/settings.js";
-import { PaperExecutor } from "../../src/exec/executor.js";
+import { PaperExecutor, type Executor } from "../../src/exec/executor.js";
 import { TipOracle } from "../../src/exec/tips.js";
 import { XMentions } from "../../src/score/context.js";
 import { ManualClock } from "../../src/util/clock.js";
@@ -16,18 +16,30 @@ import { SyntheticMarket } from "./market.js";
 
 export const T0 = Date.UTC(2026, 9, 17, 0, 0, 0);
 
-export async function simulate(minutes: number, prof?: Record<string, number>) {
+export interface SimOptions {
+  /** The tip floor endpoint stops answering this long after T0 (a Jito API outage). */
+  tipsDownAfterMs?: number;
+  /** Use this store instead of a fresh in-memory one (restart tests). */
+  store?: Store;
+  /** Start the clock here instead of T0. */
+  startMs?: number;
+  /** Replace or wrap the paper executor (fault injection). */
+  wrapExecutor?: (paper: PaperExecutor) => Executor;
+}
+
+export async function simulate(minutes: number, prof?: Record<string, number>, opts: SimOptions = {}) {
   const tm = (k: string, t: number) => { if (prof) prof[k] = (prof[k] ?? 0) + performance.now() - t; };
-  const clock = new ManualClock(T0);
-  const store = new Store(":memory:");
+  const clock = new ManualClock(opts.startMs ?? T0);
+  const store = opts.store ?? new Store(":memory:");
   const params = resolveParams({
     risk: { minOutcomeSamples: 40, minEdgePct: 0.01 },
     scoring: { baseAlphaThreshold: 55, smallBankrollThresholdAdd: 0, trajectoryMinCorpus: 60, shadowMinScore: 30 },
     ingest: { tokenStateTtlSec: 600 },
     exits: { maxHoldSec: 300 },
   });
-  const tips = new TipOracle("http://tips.invalid", (async () =>
-    new Response(
+  const tips = new TipOracle("http://tips.invalid", (async () => {
+    if (opts.tipsDownAfterMs !== undefined && clock.now() > T0 + opts.tipsDownAfterMs) throw new Error("tip floor endpoint down");
+    return new Response(
       JSON.stringify([
         {
           time: "now",
@@ -39,7 +51,8 @@ export async function simulate(minutes: number, prof?: Record<string, number>) {
           ema_landed_tips_50th_percentile: 0.00001,
         },
       ]),
-    )) as typeof fetch);
+    );
+  }) as typeof fetch, undefined, () => clock.now());
   await tips.refresh();
   const market = { global: MAINNET_GLOBAL, schedule: curveSchedule(), ammSchedule: fixtureSchedule(), ataRent: 2_074_080n, updatedAtMs: T0 };
   let engine!: Engine;
@@ -57,7 +70,7 @@ export async function simulate(minutes: number, prof?: Record<string, number>) {
     params: { get: () => params },
     clock,
     market,
-    executor: paper,
+    executor: opts.wrapExecutor ? opts.wrapExecutor(paper) : paper,
     tips,
     conn: null,
     x: new XMentions(undefined),
@@ -65,20 +78,23 @@ export async function simulate(minutes: number, prof?: Record<string, number>) {
   });
   const sim = new SyntheticMarket(MAINNET_GLOBAL, curveSchedule(), 7);
   const dt = 250;
-  for (let t = T0; t < T0 + minutes * 60_000; t += dt) {
+  const t0 = opts.startMs ?? T0;
+  for (let t = t0; t < t0 + minutes * 60_000; t += dt) {
+    // the tip oracle polls every 10 s, in simulated time
+    if ((t - t0) % 10_000 === 0) await tips.refresh();
     let q = performance.now();
     const txs = sim.step(t, dt, 0.4); tm("gen", q); q = performance.now();
     for (const tx of txs) engine.ingest(tx);
     engine.drain(); tm("drain", q); q = performance.now();
     await engine.scoreDue(); tm("score", q); q = performance.now();
-    if ((t - T0) % 1000 === 0) {
+    if ((t - t0) % 1000 === 0) {
       engine.shadows.tick();
       engine.positions.tick();
     }
     tm("ticks", q); q = performance.now();
-    if ((t - T0) % 2000 === 0) await engine.markEquity();
+    if ((t - t0) % 2000 === 0) await engine.markEquity();
     tm("equity", q);
-    if ((t - T0) % 30_000 === 0) {
+    if ((t - t0) % 30_000 === 0) {
       engine.evict();
       engine.smart.flush(clock.now());
       store.flush();
@@ -88,6 +104,6 @@ export async function simulate(minutes: number, prof?: Record<string, number>) {
     tm("advance", qa);
   }
   store.flush();
-  return { engine, store, paper, sim, params, start };
+  return { engine, store, paper, sim, params, start, clock, tips, market };
 }
 
