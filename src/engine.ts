@@ -410,10 +410,19 @@ export class Engine {
     }
   }
 
-  /** Remove raw history older than the retention window. */
+  /** Remove raw history older than the retention window, and thin old equity marks. */
   prune(): void {
-    const cutoff = this.d.clock.now() - this.params.ingest.tradeRetentionDays * 86_400_000;
+    const now = this.d.clock.now();
+    const cutoff = now - this.params.ingest.tradeRetentionDays * 86_400_000;
     this.d.store.run("DELETE FROM equity WHERE ts_ms < ?", cutoff - 60 * 86_400_000);
+    // marks are written every 2 s; beyond a day one per minute is plenty (the first of each minute is kept)
+    const dayAgo = now - 86_400_000;
+    this.d.store.run(
+      `DELETE FROM equity WHERE ts_ms < ? AND rowid NOT IN (
+         SELECT MIN(rowid) FROM equity WHERE ts_ms < ? GROUP BY mode, ts_ms / 60000)`,
+      dayAgo,
+      dayAgo,
+    );
     this.d.store.run("DELETE FROM decisions WHERE ts_ms < ? AND kind = 'score'", cutoff);
   }
 

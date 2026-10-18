@@ -179,7 +179,7 @@ export class Store {
   writeErrors = 0;
   lastWriteError: string | null = null;
 
-  constructor(path: string) {
+  constructor(readonly path: string) {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA);

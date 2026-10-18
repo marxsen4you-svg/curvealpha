@@ -151,7 +151,7 @@ try {
   }
   store.db.exec("COMMIT");
   const params = resolveParams({});
-  record("evaluate() (20k closed shadows, 14 days)", "ms", time(() => evaluate(store, params, now), 3), "runs inside the dashboard request every 5 min");
+  record("evaluate() (20k closed shadows, 14 days)", "ms", time(() => evaluate(store, params, now), 3), "the dashboard now runs it in a worker thread");
 
   const pm = new ParamsManager(join(dir, "params.json"), store);
   const tips = new TipOracle("http://tips.invalid", (async () => new Response("[]")) as typeof fetch);
@@ -164,10 +164,14 @@ try {
     await res.text();
     return performance.now() - t;
   };
-  await get(); // warm: includes the first evaluate()
+  await get(); // warm
   const xs: number[] = [];
-  for (let i = 0; i < 20; i++) xs.push(await get());
-  record(`dashboard /api/state (${nEq} equity marks)`, "ms", xs, "computed per SSE client per second");
+  // spaced past the one-second snapshot so every request builds the state (no cache hits)
+  for (let i = 0; i < 6; i++) {
+    await new Promise((res) => setTimeout(res, 1100));
+    xs.push(await get());
+  }
+  record(`dashboard /api/state (${nEq} equity marks, uncached build)`, "ms", xs, "built at most once per second, shared by all clients");
   dash.close();
   store.close();
 } finally {

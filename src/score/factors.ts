@@ -210,10 +210,18 @@ export function smartMoneyFactor(rec: TokenRecord, top: Map<string, number>, p: 
 
 // ----------------------------------------------------------- 6. social
 
+// every score compares a name against the last hour's launches; their trigram sets are built once
+const TRIGRAM_CACHE_MAX = 50_000;
+const trigramCache = new Map<string, Set<string>>();
+
 function trigrams(s: string): Set<string> {
+  const hit = trigramCache.get(s);
+  if (hit) return hit;
   const x = ` ${s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()} `;
   const out = new Set<string>();
   for (let i = 0; i + 3 <= x.length; i++) out.add(x.slice(i, i + 3));
+  if (trigramCache.size >= TRIGRAM_CACHE_MAX) trigramCache.delete(trigramCache.keys().next().value!);
+  trigramCache.set(s, out);
   return out;
 }
 
