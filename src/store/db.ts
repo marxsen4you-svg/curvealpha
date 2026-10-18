@@ -147,6 +147,27 @@ CREATE TABLE IF NOT EXISTS params_audit (
 );
 `;
 
+/**
+ * Schema migrations, applied in order and recorded in PRAGMA user_version.
+ * CREATE TABLE above is the version 0 schema and never changes; every later
+ * change is a migration, so an existing database upgrades in place.
+ */
+const MIGRATIONS: Array<(db: DatabaseSync) => void> = [
+  // 1: positions carry their full exit state so a restart can restore them; indexes for the hot queries
+  (db) => {
+    const cols = new Set((db.prepare("PRAGMA table_info(positions)").all() as Array<{ name: string }>).map((c) => c.name));
+    if (!cols.has("exit_state")) db.exec("ALTER TABLE positions ADD COLUMN exit_state TEXT");
+    if (!cols.has("rent_locked")) db.exec("ALTER TABLE positions ADD COLUMN rent_locked INTEGER NOT NULL DEFAULT 0");
+    if (!cols.has("token_program")) db.exec("ALTER TABLE positions ADD COLUMN token_program TEXT");
+    if (!cols.has("symbol")) db.exec("ALTER TABLE positions ADD COLUMN symbol TEXT");
+    db.exec(`CREATE INDEX IF NOT EXISTS positions_status ON positions(status, mode);
+             CREATE INDEX IF NOT EXISTS fills_position ON fills(position_id);
+             CREATE INDEX IF NOT EXISTS equity_mode_ts ON equity(mode, ts_ms);`);
+  },
+];
+
+export const SCHEMA_VERSION = MIGRATIONS.length;
+
 type Row = Record<string, unknown>;
 
 export class Store {
@@ -162,6 +183,25 @@ export class Store {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path);
     this.db.exec(SCHEMA);
+    this.migrate();
+  }
+
+  private migrate(): void {
+    const current = Number((this.db.prepare("PRAGMA user_version").get() as { user_version: number }).user_version);
+    if (current > MIGRATIONS.length) {
+      throw new Error(`database schema version ${current} is newer than this build understands (${MIGRATIONS.length}); refusing to open it`);
+    }
+    for (let v = current; v < MIGRATIONS.length; v++) {
+      this.db.exec("BEGIN IMMEDIATE");
+      try {
+        MIGRATIONS[v]!(this.db);
+        this.db.exec(`PRAGMA user_version = ${v + 1}`);
+        this.db.exec("COMMIT");
+      } catch (e) {
+        this.db.exec("ROLLBACK");
+        throw e;
+      }
+    }
   }
 
   stmt(sql: string): StatementSync {

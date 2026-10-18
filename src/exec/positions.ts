@@ -8,7 +8,7 @@ import type { TokenRecord } from "../ingest/tokens.js";
 import { simulateV3Buy, sellSolFromTokens, type FeeSchedule } from "../math/curve.js";
 import { BASE_FEE_PER_SIGNATURE, priorityFee } from "../risk/costs.js";
 import type { CapitalSurvivalEngine } from "../risk/survival.js";
-import type { Store } from "../store/db.js";
+import { bigintReplacer, bigintReviver, type Store } from "../store/db.js";
 import type { Clock } from "../util/clock.js";
 import { applyExitFill, evaluateExit, liquidationValue, openExitState, type CurveCtx, type ExitAction, type ExitState } from "../exits/exitEngine.js";
 import type { Executor, Fill } from "./executor.js";
@@ -120,8 +120,9 @@ export class PositionManager {
     const now = this.clock.now();
     const state = openExitState(rec.mint, fill.lamports, fill.tokens, rec, now, p);
     const row = this.store.run(
-      `INSERT INTO positions(mint, mode, status, decision_id, horizon_s, score, factors, opened_ms, stake_lamports, tokens, tokens_left, fixed_cost_lamports)
-       VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO positions(mint, mode, status, decision_id, horizon_s, score, factors, opened_ms, stake_lamports, tokens, tokens_left, fixed_cost_lamports,
+         exit_state, rent_locked, token_program, symbol)
+       VALUES (?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       rec.mint,
       this.exec.mode,
       req.decisionId,
@@ -133,6 +134,10 @@ export class PositionManager {
       fill.tokens.toString(),
       fill.tokens.toString(),
       fill.networkLamports + fill.tipLamports,
+      JSON.stringify(state, bigintReplacer),
+      fill.rentLamports,
+      rec.tokenProgram,
+      rec.symbol,
     );
     const id = Number(row.lastInsertRowid) || this.nextLocalId++;
     this.recordFill(id, "buy", fill, "entry");
@@ -219,17 +224,94 @@ export class PositionManager {
     applyExitFill(pos.state, action, sold, fill.lamports);
     this.recordFill(pos.id, action.kind === "burnClose" ? "burn" : "sell", fill, action.reason);
     if (pos.state.closed) this.close(pos, action.reason);
-    else {
-      this.store.defer(() =>
-        this.store.run(
-          "UPDATE positions SET tokens_left = ?, proceeds_lamports = ?, fixed_cost_lamports = ? WHERE id = ?",
-          pos.state.remainingTokens.toString(),
-          pos.state.realizedLamports,
-          pos.fixedCostLamports,
-          pos.id,
-        ),
-      );
+    else this.persist(pos);
+  }
+
+  /** Write a position's state now (fills are rare; a crash must not lose one). */
+  private persist(pos: Position): void {
+    this.store.run(
+      "UPDATE positions SET tokens_left = ?, proceeds_lamports = ?, fixed_cost_lamports = ?, exit_state = ? WHERE id = ?",
+      pos.state.remainingTokens.toString(),
+      pos.state.realizedLamports,
+      pos.fixedCostLamports,
+      JSON.stringify(pos.state, bigintReplacer),
+      pos.id,
+    );
+  }
+
+  /** Persist the slow-moving trailing state (peaks) of every open position; called periodically. */
+  persistOpenStates(): void {
+    const open = [...this.positions.values()];
+    this.store.defer(() => {
+      for (const pos of open) if (!pos.state.closed) this.store.run("UPDATE positions SET exit_state = ? WHERE id = ?", JSON.stringify(pos.state, bigintReplacer), pos.id);
+    });
+  }
+
+  /**
+   * Load every open position of this mode from the database (after a
+   * restart). Positions from before the exit state was persisted are rebuilt
+   * from their row with fresh trailing state.
+   */
+  restore(): Position[] {
+    const p = this.params();
+    const rows = this.store.all<{
+      id: number; mint: string; symbol: string | null; token_program: string | null; decision_id: number | null; horizon_s: number | null; score: number | null;
+      opened_ms: number; stake_lamports: number; tokens: string; tokens_left: string; proceeds_lamports: number; fixed_cost_lamports: number; exit_state: string | null; rent_locked: number;
+    }>("SELECT * FROM positions WHERE status = 'open' AND mode = ? ORDER BY id", this.exec.mode);
+    const out: Position[] = [];
+    for (const r of rows) {
+      const state: ExitState = r.exit_state
+        ? JSON.parse(r.exit_state, bigintReviver)
+        : {
+            mint: r.mint,
+            stakeLamports: BigInt(r.stake_lamports),
+            initialTokens: BigInt(r.tokens),
+            remainingTokens: BigInt(r.tokens_left),
+            openedAtMs: r.opened_ms,
+            tpDone: p.exits.tpLevels.map(() => false),
+            peakMultipleE6: 0n,
+            peakInflowRate: 0,
+            creatorHeldAtEntry: 0n,
+            creatorSoldAtEntry: 0n,
+            realizedLamports: BigInt(r.proceeds_lamports),
+            sellTxCount: 0,
+            closed: false,
+          };
+      // creator sells are counted again from zero by the record rebuilt after the restart
+      state.creatorSoldAtEntry = 0n;
+      const pos: Position = {
+        id: r.id,
+        mint: r.mint,
+        symbol: r.symbol ?? "",
+        tokenProgram: r.token_program ?? "",
+        state,
+        score: r.score ?? 0,
+        horizon: r.horizon_s ?? 0,
+        decisionId: r.decision_id ?? 0,
+        fixedCostLamports: BigInt(r.fixed_cost_lamports),
+        rentLocked: BigInt(r.rent_locked),
+        pending: false,
+        failures: 0,
+        openedAtMs: r.opened_ms,
+        lastValueLamports: 0n,
+        closeReason: null,
+      };
+      this.positions.set(pos.id, pos);
+      out.push(pos);
     }
+    this.survival.setOpenPositions(this.positions.size);
+    return out;
+  }
+
+  /** Mints of open positions with no curve record: held, counted, but not yet managed. */
+  unmanaged(): string[] {
+    return [...this.positions.values()].filter((p) => !this.token(p.mint)).map((p) => p.mint);
+  }
+
+  /** Mark a position to its exact liquidation value now. */
+  revalue(pos: Position): void {
+    const rec = this.token(pos.mint);
+    if (rec) pos.lastValueLamports = liquidationValue(this.ctx(), rec.curve, pos.state.remainingTokens);
   }
 
   private async submitExit(pos: Position, action: ExitAction, tip: bigint, emergency: boolean): Promise<{ fill: Fill; sold: bigint }> {
@@ -263,37 +345,33 @@ export class PositionManager {
     if (this.closed.length > 200) this.closed.pop();
     this.survival.setOpenPositions(this.positions.size);
     const now = this.clock.now();
-    this.store.defer(() =>
-      this.store.run(
-        "UPDATE positions SET status = 'closed', closed_ms = ?, tokens_left = '0', proceeds_lamports = ?, fixed_cost_lamports = ?, close_reason = ? WHERE id = ?",
-        now,
-        pos.state.realizedLamports,
-        pos.fixedCostLamports,
-        reason,
-        pos.id,
-      ),
+    this.store.run(
+      "UPDATE positions SET status = 'closed', closed_ms = ?, tokens_left = '0', proceeds_lamports = ?, fixed_cost_lamports = ?, close_reason = ?, exit_state = ? WHERE id = ?",
+      now,
+      pos.state.realizedLamports,
+      pos.fixedCostLamports,
+      reason,
+      JSON.stringify(pos.state, bigintReplacer),
+      pos.id,
     );
   }
 
   private recordFill(positionId: number, side: string, f: Fill, reason: string): void {
-    const now = this.clock.now();
-    this.store.defer(() =>
-      this.store.run(
-        `INSERT INTO fills(position_id, ts_ms, side, lamports, tokens, fees_lamports, tip_lamports, network_lamports, signature, bundle_id, landed, reason)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        positionId,
-        now,
-        side,
-        f.lamports,
-        f.tokens.toString(),
-        f.curveFeesLamports,
-        f.tipLamports,
-        f.networkLamports,
-        f.signature ?? null,
-        f.bundleId ?? null,
-        f.ok ? 1 : 0,
-        reason,
-      ),
+    this.store.run(
+      `INSERT INTO fills(position_id, ts_ms, side, lamports, tokens, fees_lamports, tip_lamports, network_lamports, signature, bundle_id, landed, reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      positionId,
+      this.clock.now(),
+      side,
+      f.lamports,
+      f.tokens.toString(),
+      f.curveFeesLamports,
+      f.tipLamports,
+      f.networkLamports,
+      f.signature ?? null,
+      f.bundleId ?? null,
+      f.ok ? 1 : 0,
+      reason,
     );
   }
 

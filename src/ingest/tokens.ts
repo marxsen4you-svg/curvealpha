@@ -190,6 +190,65 @@ export class TokenBook {
     return rec;
   }
 
+  /**
+   * Rebuild a record for a mint we hold but whose creation we did not see in
+   * this process (after a restart), from a chain read of its curve at `slot`.
+   * Its history is unknown, so it is marked as having a gap: it is managed
+   * (exits, valuation) but never scored or archived. A baseline tape entry
+   * well in the past makes inflow-rate exits measure flow since adoption
+   * instead of seeing the whole curve arrive at once.
+   */
+  adopt(a: { mint: string; curve: CurveState; creator: string; tokenProgram: string; symbol: string; slot: number }, nowMs: number): TokenRecord {
+    const existing = this.tokens.get(a.mint);
+    if (existing) return existing;
+    const rec: TokenRecord = {
+      mint: a.mint,
+      creator: a.creator,
+      name: "",
+      symbol: a.symbol,
+      uri: "",
+      tokenProgram: a.tokenProgram,
+      createdSlot: a.slot,
+      createdAtMs: nowMs,
+      isMayhem: a.curve.isMayhemMode,
+      isCashback: a.curve.isCashbackCoin,
+      quoteIsSol: true,
+      curve: { ...a.curve },
+      lastSlot: a.slot,
+      // the read reflects the end of its slot: later events in the same slot are older than it
+      lastSeq: Number.MAX_SAFE_INTEGER,
+      completedAtMs: a.curve.complete ? nowMs : null,
+      trades: [
+        {
+          slot: a.slot,
+          seq: -1,
+          tMs: nowMs - 3_600_000,
+          user: "",
+          isBuy: false,
+          sol: 0n,
+          tokens: 0n,
+          vS: a.curve.virtualSolReserves,
+          vT: a.curve.virtualTokenReserves,
+          rS: a.curve.realSolReserves,
+          preBal: null,
+        },
+      ],
+      holders: new Map(),
+      basis: new Map(),
+      creatorBoughtTokens: 0n,
+      creatorSoldTokens: 0n,
+      creatorFirstSellMs: null,
+      creatorSelfBuy: false,
+      peakVsol: a.curve.virtualSolReserves,
+      peakAtMs: nowMs,
+      gap: true,
+      tainted: false,
+      scoredHorizons: new Set(),
+    };
+    this.tokens.set(a.mint, rec);
+    return rec;
+  }
+
   markComplete(mint: string, atMs: number): void {
     const rec = this.tokens.get(mint);
     if (rec && rec.completedAtMs === null) rec.completedAtMs = atMs;

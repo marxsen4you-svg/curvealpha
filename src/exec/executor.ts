@@ -100,6 +100,8 @@ export class PaperExecutor implements Executor {
     private clock: Clock,
     startingLamports: bigint,
     private ataRent: () => bigint,
+    /** Called after every change to the paper cash, so a crash never loses a fill's effect on the ledger. */
+    private onCash: (cash: bigint) => void = () => undefined,
   ) {
     this.cash = startingLamports;
   }
@@ -124,6 +126,7 @@ export class PaperExecutor implements Executor {
     const network = this.network(BigInt(this.params().execution.paperBuyCuLimit));
     const spent = sim.netSol + sim.fees;
     this.cash -= spent + network + o.tipLamports + this.ataRent();
+    this.onCash(this.cash);
     return {
       ok: true,
       lamports: spent,
@@ -155,6 +158,7 @@ export class PaperExecutor implements Executor {
     }
     if (net < o.minSolOut) return fail(`slippage: ${net} lamports < minimum ${o.minSolOut}`);
     this.cash += net - network - o.tipLamports - rent;
+    this.onCash(this.cash);
     return { ok: true, lamports: net, tokens: o.tokens, curveFeesLamports: fees, networkLamports: network, tipLamports: o.tipLamports, rentLamports: rent, estimate };
   }
 
@@ -162,6 +166,7 @@ export class PaperExecutor implements Executor {
     await this.clock.sleep(this.params().execution.paperLatencyMs);
     const network = this.network(20_000n);
     this.cash += this.ataRent() - network - tipLamports;
+    this.onCash(this.cash);
     return { ok: true, lamports: 0n, tokens, curveFeesLamports: 0n, networkLamports: network, tipLamports, rentLamports: -this.ataRent() };
   }
 }

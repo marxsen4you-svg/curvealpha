@@ -15,7 +15,7 @@ import { loadSettings, settingsProblems } from "./config/settings.js";
 import { ParamsManager } from "./config/manager.js";
 import { countParams } from "./config/params.js";
 import { Store } from "./store/db.js";
-import { fetchAtaRent, fetchProtocolState } from "./chain/accounts.js";
+import { curveReader, fetchAtaRent, fetchProtocolState } from "./chain/accounts.js";
 import { pumpSdk, pumpSwapSdk } from "./chain/sdk.js";
 import { scheduleFromSdk } from "./chain/state.js";
 import { Engine, type MarketState } from "./engine.js";
@@ -92,7 +92,9 @@ async function run(): Promise<void> {
   if (settings.mode === "paper") {
     const saved = store.kvGet("paper_cash");
     starting = saved ? BigInt(saved) : BigInt(Math.round(settings.paperStartingSol * 1e9));
-    paper = new PaperExecutor(marketCtx, params.get, systemClock, starting, () => engineRef!.market.ataRent);
+    paper = new PaperExecutor(marketCtx, params.get, systemClock, starting, () => engineRef!.market.ataRent, (cash) =>
+      store.kvSet("paper_cash", cash.toString()),
+    );
     executor = paper;
   } else {
     const { keypair, warnings } = loadKeypair(settings.keypairPath!);
@@ -116,6 +118,10 @@ async function run(): Promise<void> {
     startingEquityLamports: starting,
   });
   engineRef = engine;
+  const restored = await engine.restorePositions(curveReader(conn));
+  if (restored.restored > 0) {
+    console.log(`Restored ${restored.restored} open position(s) from the database${restored.unmanaged ? `, ${restored.unmanaged} without a readable curve (retried every 30 s)` : ""}.`);
+  }
 
   const p = params.get;
   const ingest = new YellowstoneIngest(
@@ -157,9 +163,6 @@ async function run(): Promise<void> {
       /* keep the last good state; the dashboard shows its age */
     }
   }, 300_000);
-  const persist = setInterval(() => {
-    if (paper) store.kvSet("paper_cash", paper.cash.toString());
-  }, 2_000);
 
   const dash = startDashboard({ engine, params, settings, ingest, tips, store });
   console.log(`Dashboard: ${dash.url}  (${countParams()} tunable parameters in ${join(settings.dataDir, "params.json")})`);
@@ -167,7 +170,6 @@ async function run(): Promise<void> {
   const shutdown = () => {
     console.log("Stopping: flushing state...");
     clearInterval(refresh);
-    clearInterval(persist);
     if (paper) store.kvSet("paper_cash", paper.cash.toString());
     ingest.stop();
     tips.stop();

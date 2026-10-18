@@ -13,7 +13,7 @@ import type { ParamsManager } from "./config/manager.js";
 import type { Params } from "./config/params.js";
 import type { Settings } from "./config/settings.js";
 import { parsePumpEvents, type RawTx } from "./chain/events.js";
-import type { FeeSchedule, GlobalParams } from "./math/curve.js";
+import type { CurveState, FeeSchedule, GlobalParams } from "./math/curve.js";
 import { TokenBook, type TokenRecord } from "./ingest/tokens.js";
 import { BoundedQueue } from "./ingest/queue.js";
 import { scoreToken, type AlphaResult } from "./score/alpha.js";
@@ -34,6 +34,17 @@ export interface MarketState {
   ataRent: bigint;
   updatedAtMs: number;
 }
+
+/** A curve read from the chain (RPC), used to rebuild the record of a mint held across a restart. */
+export interface AdoptedCurve {
+  curve: CurveState;
+  creator: string;
+  tokenProgram: string;
+  symbol: string;
+  slot: number;
+}
+
+export type CurveReader = (mint: string) => Promise<AdoptedCurve | null>;
 
 export interface EngineDeps {
   settings: Settings;
@@ -80,6 +91,7 @@ export class Engine {
   private running = false;
   private cashCache: bigint;
   private seedCounter = 1;
+  private readCurve: CurveReader | null = null;
 
   constructor(private d: EngineDeps) {
     const p = () => d.params.get();
@@ -319,9 +331,48 @@ export class Engine {
     return decision;
   }
 
+  /**
+   * After a restart: load every open position of this mode from the database
+   * and rebuild each curve record from a chain read so its exits keep running.
+   * A position whose curve cannot be read stays held and counted, unmanaged,
+   * and is retried by retryAdoptions().
+   */
+  async restorePositions(readCurve: CurveReader): Promise<{ restored: number; unmanaged: number }> {
+    this.readCurve = readCurve;
+    const restored = this.positions.restore();
+    await this.retryAdoptions();
+    for (const pos of restored) this.positions.revalue(pos);
+    const unmanaged = this.positions.unmanaged().length;
+    if (restored.length > 0) {
+      this.d.store.logDecision(this.d.clock.now(), null, "restore", unmanaged === 0, `restored ${restored.length} open position(s), ${unmanaged} unmanaged`, {
+        positions: restored.map((p) => ({ id: p.id, mint: p.mint, remainingTokens: p.state.remainingTokens })),
+      });
+    }
+    return { restored: restored.length, unmanaged };
+  }
+
+  /** Try again to read the curve of every held mint that has no record; returns how many were adopted. */
+  async retryAdoptions(): Promise<number> {
+    if (!this.readCurve) return 0;
+    let adopted = 0;
+    for (const mint of this.positions.unmanaged()) {
+      let a: AdoptedCurve | null = null;
+      try {
+        a = await this.readCurve(mint);
+      } catch (e) {
+        console.error(`curve read for held mint ${mint} failed`, e);
+      }
+      if (!a) continue;
+      this.tokens.adopt({ mint, ...a }, this.d.clock.now());
+      adopted++;
+    }
+    return adopted;
+  }
+
   /** Mark equity, persist the survival state and roll equity history. */
   async markEquity(): Promise<void> {
     const now = this.d.clock.now();
+    this.positions.persistOpenStates();
     this.cashCache = await this.d.executor.spendableLamports();
     const equity = this.cashCache + this.positions.heldValue();
     this.survival.updateEquity(Number(equity), now);
@@ -367,6 +418,7 @@ export class Engine {
     every(2000, () => this.markEquity());
     every(5000, () => this.smart.flush(this.d.clock.now()));
     every(30_000, () => this.evict());
+    every(30_000, () => this.retryAdoptions());
     every(3_600_000, () => this.prune());
     while (this.running) {
       const tx = await this.queue.take();

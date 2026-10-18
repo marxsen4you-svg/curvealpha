@@ -67,3 +67,12 @@ export async function fetchCurve(conn: Connection, mint: PublicKey): Promise<Cur
 export async function fetchAtaRent(conn: Connection, tokenAccountSize = 170): Promise<bigint> {
   return BigInt(await conn.getMinimumBalanceForRentExemption(tokenAccountSize, "confirmed"));
 }
+
+/** A CurveReader over RPC: rebuilds a held mint's curve record after a restart. */
+export function curveReader(conn: Connection): (mint: string) => Promise<{ curve: DecodedCurve["state"]; creator: string; tokenProgram: string; symbol: string; slot: number } | null> {
+  return async (mint) => {
+    const r = await fetchCurve(conn, new PublicKey(mint));
+    if (!r) return null;
+    return { curve: r.state, creator: r.creator, tokenProgram: r.tokenProgram.toBase58(), symbol: "", slot: r.slot };
+  };
+}
