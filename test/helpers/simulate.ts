@@ -70,7 +70,7 @@ export class Sim {
   }
 
   /** Build an engine on a store, with paper cash restored from it as the CLI does. */
-  boot(store: Store): Engine {
+  boot(store: Store, wrap?: (paper: PaperExecutor) => Executor): Engine {
     this.store = store;
     const saved = store.kvGet("paper_cash");
     const cash = saved ? BigInt(saved) : START;
@@ -89,7 +89,7 @@ export class Sim {
       params: { get: () => this.params },
       clock: this.clock,
       market: this.market,
-      executor: this.opts.wrapExecutor ? this.opts.wrapExecutor(this.paper) : this.paper,
+      executor: (wrap ?? this.opts.wrapExecutor)?.(this.paper) ?? this.paper,
       tips: this.tips,
       conn: null,
       x: new XMentions(undefined),

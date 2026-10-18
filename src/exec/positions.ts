@@ -303,6 +303,21 @@ export class PositionManager {
     return out;
   }
 
+  /**
+   * Align a position with what the wallet actually holds (after a restart, a
+   * sell or burn may have landed without being recorded). None held closes it.
+   */
+  reconcileHolding(pos: Position, actual: bigint): void {
+    if (actual === 0n) {
+      pos.state.remainingTokens = 0n;
+      pos.state.closed = true;
+      this.close(pos, "reconciled: the wallet holds none of this mint (an unrecorded sell or burn)");
+      return;
+    }
+    pos.state.remainingTokens = actual;
+    this.persist(pos);
+  }
+
   /** Mints of open positions with no curve record: held, counted, but not yet managed. */
   unmanaged(): string[] {
     return [...this.positions.values()].filter((p) => !this.token(p.mint)).map((p) => p.mint);

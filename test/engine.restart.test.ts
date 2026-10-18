@@ -72,6 +72,26 @@ describe("restart recovery", () => {
     expect(s.paper.cash).toBe(expected);
   }, 600_000);
 
+  it("trusts the wallet over the database: a sell that landed but was never recorded is reconciled on restore", async () => {
+    const { s, path, before, chain } = await crashWithOpenPosition();
+    const [first, ...rest] = before;
+    // the wallet holds a third of the first position's tokens and none of the others
+    const held = new Map<string, bigint>([[first!.mint, first!.remaining / 3n]]);
+    const b = s.boot(new Store(path), (paper) => ({
+      mode: paper.mode,
+      buy: (o) => paper.buy(o),
+      sell: (o) => paper.sell(o),
+      burnClose: (...a) => paper.burnClose(...a),
+      spendableLamports: () => paper.spendableLamports(),
+      holdingsOf: async (mint) => held.get(mint) ?? 0n,
+    }));
+    await b.restorePositions(chainReader(chain));
+    expect(b.positions.positions.get(first!.id)!.state.remainingTokens).toBe(first!.remaining / 3n);
+    for (const x of rest) expect(b.positions.positions.has(x.id)).toBe(false);
+    const recon = s.store.all<{ summary: string }>("SELECT summary FROM decisions WHERE kind = 'reconcile'");
+    expect(recon.length).toBe(before.length);
+  }, 600_000);
+
   it("keeps a position whose curve cannot be read as unmanaged, still counted, and adopts it on a later retry", async () => {
     const { s, path, before, chain } = await crashWithOpenPosition();
     const b = s.boot(new Store(path));

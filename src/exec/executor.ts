@@ -11,7 +11,7 @@
  */
 import BN from "bn.js";
 import bs58 from "bs58";
-import { Connection, Keypair, PublicKey } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, type SignatureStatus } from "@solana/web3.js";
 import { createCloseAccountInstruction } from "@solana/spl-token";
 import { pumpSwapSdk } from "../chain/sdk.js";
 import type { Params } from "../config/params.js";
@@ -75,6 +75,14 @@ export interface Executor {
   sell(o: SellOrder): Promise<Fill>;
   burnClose(mint: string, tokenProgram: string, tokens: bigint, tipLamports: bigint): Promise<Fill>;
   spendableLamports(): Promise<bigint>;
+  /** Tokens of this mint the wallet actually holds, or null when that cannot be read right now (live only). */
+  holdingsOf?(mint: string, tokenProgram: string): Promise<bigint | null>;
+}
+
+interface Holdings {
+  sol: bigint;
+  tokens: bigint;
+  ataLamports: bigint;
 }
 
 const fail = (error: string): Fill => ({
@@ -192,69 +200,156 @@ export class LiveExecutor implements Executor {
     return BigInt(await this.conn.getBalance(this.user, "confirmed"));
   }
 
-  /** Measure, assemble, sign, send as a bundle, wait for landing, read the real deltas. */
-  private async submit(
-    ixs: Awaited<ReturnType<typeof buyIxs>>,
-    tipLamports: bigint,
-    mint: PublicKey,
-  ): Promise<Fill> {
+  async holdingsOf(mint: string, tokenProgram: string): Promise<bigint | null> {
+    const ata = userAta(this.user, new PublicKey(mint), new PublicKey(tokenProgram));
+    try {
+      const acc = await this.conn.getAccountInfo(ata, "confirmed");
+      if (!acc) return 0n; // no token account: nothing held
+      const r = await this.conn.getTokenAccountBalance(ata, "confirmed");
+      return BigInt(r.value.amount);
+    } catch {
+      return null;
+    }
+  }
+
+  /** What the wallet and the order's token account hold right now. */
+  private async holdings(ata: PublicKey): Promise<Holdings> {
+    const [sol, tokens, acc] = await Promise.all([
+      this.conn.getBalance(this.user, "processed"),
+      this.conn
+        .getTokenAccountBalance(ata, "processed")
+        .then((r) => BigInt(r.value.amount))
+        .catch(() => 0n), // no token account yet
+      this.conn.getAccountInfo(ata, "processed").catch(() => null),
+    ]);
+    return { sol: BigInt(sol), tokens, ataLamports: BigInt(acc?.lamports ?? 0) };
+  }
+
+  private async status(sig: string): Promise<SignatureStatus | null> {
+    try {
+      return (await this.conn.getSignatureStatuses([sig])).value[0] ?? null;
+    } catch {
+      return null; // a transient RPC error is not an answer; keep polling
+    }
+  }
+
+  /**
+   * Measure, assemble, sign, send as a bundle, and track the transaction
+   * until it is settled one way or the other. The returned fill's lamports
+   * are the SOL that left the wallet net of the network fee and the tip
+   * (negative when SOL came in), rentLamports is the change in the token
+   * account's lamports (rent deposited, or refunded when negative), and
+   * tokens is the size of the token balance change.
+   *
+   * "Did not land" is only reported once the blockhash has expired, because
+   * until then the transaction can still land. A confirmed transaction is
+   * read from its own metadata; if the RPC has not indexed it, the fill is
+   * reconciled from the balances and marked as an estimate.
+   */
+  private async submit(ixs: Awaited<ReturnType<typeof buyIxs>>, tipLamports: bigint, mint: PublicKey, tokenProgram: PublicKey): Promise<Fill> {
     const p = this.params().execution;
     const tipAccount = new PublicKey(await this.bundles.randomTipAccount());
     const all = [...ixs, tipIx(this.user, tipAccount, tipLamports)];
     const measured = await measureCompute(this.conn, this.user, all);
     if (measured.err) return fail(`simulation failed: ${JSON.stringify(measured.err)} ${measured.logs.slice(-3).join(" | ")}`);
     const cuLimit = cuLimitFor(measured.unitsConsumed, p.cuMarginPct);
-    const { blockhash } = await this.conn.getLatestBlockhash("confirmed");
-    const tx = assemble(this.user, blockhash, all, cuLimit, BigInt(p.cuPriceMicroLamports));
+    const cuPrice = BigInt(p.cuPriceMicroLamports);
+    const { blockhash, lastValidBlockHeight } = await this.conn.getLatestBlockhash("confirmed");
+    const tx = assemble(this.user, blockhash, all, cuLimit, cuPrice);
     tx.sign([this.signer]);
     const sig58 = bs58.encode(tx.signatures[0]!);
-    const preSol = BigInt(await this.conn.getBalance(this.user, "processed"));
-    const { bundleId, route } = await this.bundles.sendBundle([Buffer.from(tx.serialize()).toString("base64")], p.useBam);
+    // what this transaction pays if it lands, exactly: one signature plus the priority fee on the requested limit
+    const fee = BASE_FEE_PER_SIGNATURE + priorityFee(cuPrice, BigInt(cuLimit));
+    const ata = userAta(this.user, mint, tokenProgram);
+    const before = await this.holdings(ata);
+    let sent: { bundleId?: string; route?: "bam" | "block-engine" } = {};
+    let sendError: string | null = null;
+    try {
+      sent = await this.bundles.sendBundle([Buffer.from(tx.serialize()).toString("base64")], p.useBam);
+    } catch (e) {
+      // the block engine may have accepted it before the error: track it to expiry like any other
+      sendError = e instanceof Error ? e.message : String(e);
+    }
+    const ctx = { signature: sig58, bundleId: sent.bundleId, route: sent.route, cuLimit };
     const deadline = this.clock.now() + p.bundleTimeoutMs;
-    while (this.clock.now() < deadline) {
+    for (;;) {
       await this.clock.sleep(400);
-      const st = await this.conn.getSignatureStatuses([sig58]);
-      const s = st.value[0];
-      if (s?.err) return { ...fail(`landed with error ${JSON.stringify(s.err)}`), signature: sig58, bundleId, route };
+      const s = await this.status(sig58);
+      if (s?.err) return { ...fail(`landed with error ${JSON.stringify(s.err)}`), ...ctx };
       if (s && (s.confirmationStatus === "confirmed" || s.confirmationStatus === "finalized")) {
-        const t = await this.conn.getTransaction(sig58, { commitment: "confirmed", maxSupportedTransactionVersion: 0 });
-        const keys = t?.transaction.message.getAccountKeys({ accountKeysFromLookups: t.meta?.loadedAddresses }).staticAccountKeys ?? [];
-        const idx = keys.findIndex((k) => k.equals(this.user));
-        const pre = BigInt(t?.meta?.preBalances[idx] ?? Number(preSol));
-        const post = BigInt(t?.meta?.postBalances[idx] ?? 0);
-        const tok = (list: Array<{ owner?: string; mint: string; uiTokenAmount: { amount: string } }> | null | undefined) =>
-          BigInt(list?.find((b) => b.owner === this.user.toBase58() && b.mint === mint.toBase58())?.uiTokenAmount.amount ?? "0");
-        const tokenDelta = tok(t?.meta?.postTokenBalances) - tok(t?.meta?.preTokenBalances);
-        const fee = BigInt(t?.meta?.fee ?? 0);
-        return {
-          ok: true,
-          // signed SOL delta of the wallet excluding the network fee and the tip
-          lamports: pre - post - fee - tipLamports,
-          tokens: tokenDelta < 0n ? -tokenDelta : tokenDelta,
-          curveFeesLamports: 0n,
-          networkLamports: fee,
-          tipLamports,
-          rentLamports: 0n,
-          signature: sig58,
-          bundleId,
-          route,
-          landedSlot: s.slot,
-          cuLimit,
-        };
+        return this.settle(sig58, s.slot, before, ata, mint, fee, tipLamports, ctx);
+      }
+      if (this.clock.now() >= deadline) {
+        const height = await this.conn.getBlockHeight("confirmed").catch(() => null);
+        if (height !== null && height > lastValidBlockHeight) break;
       }
     }
-    const inflight = await this.bundles.inflightStatus(bundleId).catch(() => ({ status: "Unknown" as const, landedSlot: null }));
-    return { ...fail(`bundle not confirmed in ${p.bundleTimeoutMs} ms (status ${inflight.status})`), bundleId, route };
+    // the blockhash has expired, so the transaction can no longer land: one last look, then the balances decide
+    const last = await this.status(sig58);
+    if (last?.err) return { ...fail(`landed with error ${JSON.stringify(last.err)}`), ...ctx };
+    if (last && (last.confirmationStatus === "confirmed" || last.confirmationStatus === "finalized")) {
+      return this.settle(sig58, last.slot, before, ata, mint, fee, tipLamports, ctx);
+    }
+    const after = await this.holdings(ata);
+    if (after.tokens !== before.tokens) return this.fromBalances(before, after, fee, tipLamports, ctx);
+    const why = sent.bundleId ? `bundle ${sent.bundleId}` : `bundle not accepted: ${sendError ?? "unknown"}`;
+    return { ...fail(`not landed: blockhash expired (${why})`), ...ctx };
+  }
+
+  /** Settle a confirmed transaction from its metadata, waiting a little for the RPC to index it. */
+  private async settle(sig: string, slot: number, before: Holdings, ata: PublicKey, mint: PublicKey, fee: bigint, tip: bigint, ctx: Partial<Fill>): Promise<Fill> {
+    for (let i = 0; i < 8; i++) {
+      const t = await this.conn.getTransaction(sig, { commitment: "confirmed", maxSupportedTransactionVersion: 0 }).catch(() => null);
+      if (t?.meta) {
+        const keys = t.transaction.message.getAccountKeys({ accountKeysFromLookups: t.meta.loadedAddresses }).staticAccountKeys;
+        const u = keys.findIndex((k) => k.equals(this.user));
+        const a = keys.findIndex((k) => k.equals(ata));
+        if (u >= 0) {
+          const tok = (list: Array<{ owner?: string; mint: string; uiTokenAmount: { amount: string } }> | null | undefined) =>
+            BigInt(list?.find((b) => b.owner === this.user.toBase58() && b.mint === mint.toBase58())?.uiTokenAmount.amount ?? "0");
+          const tokenDelta = tok(t.meta.postTokenBalances) - tok(t.meta.preTokenBalances);
+          const actualFee = BigInt(t.meta.fee);
+          return {
+            ok: true,
+            lamports: BigInt(t.meta.preBalances[u]!) - BigInt(t.meta.postBalances[u]!) - actualFee - tip,
+            tokens: tokenDelta < 0n ? -tokenDelta : tokenDelta,
+            curveFeesLamports: 0n,
+            networkLamports: actualFee,
+            tipLamports: tip,
+            rentLamports: a >= 0 ? BigInt(t.meta.postBalances[a]!) - BigInt(t.meta.preBalances[a]!) : 0n,
+            landedSlot: slot,
+            ...ctx,
+          };
+        }
+      }
+      await this.clock.sleep(400);
+    }
+    return this.fromBalances(before, await this.holdings(ata), fee, tip, { ...ctx, landedSlot: slot });
+  }
+
+  /** A fill reconstructed from balance changes (the transaction itself could not be read). */
+  private fromBalances(before: Holdings, after: Holdings, fee: bigint, tip: bigint, ctx: Partial<Fill>): Fill {
+    const tokenDelta = after.tokens - before.tokens;
+    return {
+      ok: true,
+      estimate: true,
+      lamports: before.sol - after.sol - fee - tip,
+      tokens: tokenDelta < 0n ? -tokenDelta : tokenDelta,
+      curveFeesLamports: 0n,
+      networkLamports: fee,
+      tipLamports: tip,
+      rentLamports: after.ataLamports - before.ataLamports,
+      ...ctx,
+    };
   }
 
   async buy(o: BuyOrder): Promise<Fill> {
     const mint = new PublicKey(o.mint);
     const tp = new PublicKey(o.tokenProgram);
-    const f = await this.submit(await buyIxs(this.user, mint, tp, o.budgetLamports, o.minTokensOut), o.tipLamports, mint);
+    const f = await this.submit(await buyIxs(this.user, mint, tp, o.budgetLamports, o.minTokensOut), o.tipLamports, mint, tp);
     if (!f.ok) return f;
-    // lamports above is SOL out of the wallet net of fee and tip; split off the ATA rent it includes
-    const rent = BigInt(await this.conn.getMinimumBalanceForRentExemption(170));
-    return { ...f, lamports: f.lamports - rent, rentLamports: rent };
+    // SOL out of the wallet includes the rent the token account took (none if it already existed)
+    return { ...f, lamports: f.lamports - f.rentLamports };
   }
 
   async sell(o: SellOrder): Promise<Fill> {
@@ -271,18 +366,17 @@ export class LiveExecutor implements Executor {
     } else {
       ixs = await sellIxs(this.user, mint, tp, o.tokens, o.minSolOut, o.closeAccount);
     }
-    const f = await this.submit(ixs, o.tipLamports, mint);
+    const f = await this.submit(ixs, o.tipLamports, mint, tp);
     if (!f.ok) return f;
-    // a sell moves SOL into the wallet: flip the sign so lamports is proceeds,
-    // and split off the rent refund when the account was closed
-    const rent = o.closeAccount ? BigInt(await this.conn.getMinimumBalanceForRentExemption(170)) : 0n;
-    return { ...f, lamports: -f.lamports - rent, rentLamports: -rent };
+    // a sell moves SOL into the wallet: flip the sign so lamports is proceeds, without the
+    // rent refunded by closing the account (rentLamports is negative then)
+    return { ...f, lamports: -f.lamports + f.rentLamports };
   }
 
   async burnClose(mintS: string, tokenProgram: string, tokens: bigint, tipLamports: bigint): Promise<Fill> {
     const mint = new PublicKey(mintS);
     const tp = new PublicKey(tokenProgram);
-    const f = await this.submit(burnCloseIxs(this.user, mint, tp, tokens), tipLamports, mint);
-    return f.ok ? { ...f, lamports: 0n, rentLamports: f.lamports } : f;
+    const f = await this.submit(burnCloseIxs(this.user, mint, tp, tokens), tipLamports, mint, tp);
+    return f.ok ? { ...f, lamports: 0n } : f;
   }
 }

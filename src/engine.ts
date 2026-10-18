@@ -340,15 +340,27 @@ export class Engine {
   async restorePositions(readCurve: CurveReader): Promise<{ restored: number; unmanaged: number }> {
     this.readCurve = readCurve;
     const restored = this.positions.restore();
+    // the wallet is the truth: an exit may have landed after the last thing the database saw
+    for (const pos of restored) {
+      const held = await this.d.executor.holdingsOf?.(pos.mint, pos.tokenProgram);
+      if (held === undefined || held === null || held === pos.state.remainingTokens) continue;
+      this.d.store.logDecision(this.d.clock.now(), pos.mint, "reconcile", null, `position ${pos.id}: database ${pos.state.remainingTokens} tokens, wallet ${held}`, {
+        positionId: pos.id,
+        recorded: pos.state.remainingTokens,
+        wallet: held,
+      });
+      this.positions.reconcileHolding(pos, held);
+    }
     await this.retryAdoptions();
     for (const pos of restored) this.positions.revalue(pos);
     const unmanaged = this.positions.unmanaged().length;
+    const open = restored.filter((p) => this.positions.positions.has(p.id));
     if (restored.length > 0) {
-      this.d.store.logDecision(this.d.clock.now(), null, "restore", unmanaged === 0, `restored ${restored.length} open position(s), ${unmanaged} unmanaged`, {
-        positions: restored.map((p) => ({ id: p.id, mint: p.mint, remainingTokens: p.state.remainingTokens })),
+      this.d.store.logDecision(this.d.clock.now(), null, "restore", unmanaged === 0, `restored ${open.length} open position(s), ${unmanaged} unmanaged`, {
+        positions: open.map((p) => ({ id: p.id, mint: p.mint, remainingTokens: p.state.remainingTokens })),
       });
     }
-    return { restored: restored.length, unmanaged };
+    return { restored: open.length, unmanaged };
   }
 
   /** Try again to read the curve of every held mint that has no record; returns how many were adopted. */
