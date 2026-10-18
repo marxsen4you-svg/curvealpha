@@ -13,8 +13,13 @@
  *    mark (true flow control, not dropping).
  *
  * If the provider no longer has the requested from_slot (retention is short
- * on most plans), the subscription is retried without it and the gap is
+ * on most plans), or the replay keeps failing for any other reason (three
+ * attempts), the subscription continues live without it and the gap is
  * recorded so every token alive during it is marked incomplete.
+ *
+ * Transactions delivered by a replay carry the replay's receive time, not
+ * their block's, so they are tagged (RawTx.replayed) and the engine never
+ * scores the mints they touch.
  */
 import bs58 from "bs58";
 import type { RawTx } from "../chain/events.js";
@@ -45,7 +50,14 @@ export interface IngestOptions {
   reconnectMaxMs: () => number;
   fromSlotRewind: () => number;
   pingIntervalSec: () => number;
+  /** The Yellowstone client module; injectable for tests. */
+  loadClientModule?: () => Promise<unknown>;
 }
+
+/** Replay attempts that fail, for any reason, before continuing live and recording a gap. */
+export const MAX_REPLAY_FAILURES = 3;
+/** Slots of slack on the estimated end of a replay (slot times vary around 400 ms). */
+const REPLAY_SLACK_SLOTS = 50;
 
 /** Fixed-size set of recent signatures for replay de-duplication. */
 export class RecentSet {
@@ -121,6 +133,9 @@ export class YellowstoneIngest {
   private seen = new RecentSet(200_000);
   private attempt = 0;
   private pingTimer: NodeJS.Timeout | null = null;
+  private replayFailures = 0;
+  /** While set, transactions at or below this slot are replayed history, not live. */
+  private replayUntilSlot: number | null = null;
 
   constructor(
     private opts: IngestOptions,
@@ -149,17 +164,25 @@ export class YellowstoneIngest {
   async start(): Promise<void> {
     while (!this.stopped) {
       const resumeFrom = this.status.lastSlot > 0 ? Math.max(0, this.status.lastSlot - this.opts.fromSlotRewind()) : null;
+      // the replay re-sends history up to about the live tip: estimate it from the outage length
+      this.replayUntilSlot =
+        resumeFrom === null ? null : this.status.lastSlot + Math.ceil((Date.now() - this.status.lastMessageAtMs) / 400) + REPLAY_SLACK_SLOTS;
+      let failed = false;
+      let gotData = false;
       try {
-        await this.runOnce(resumeFrom);
+        gotData = await this.runOnce(resumeFrom);
       } catch (err) {
         this.status.connected = false;
-        if (resumeFrom !== null && /from.?slot|not available|too old|retention/i.test(String(err))) {
-          // the provider cannot replay this far back: continue live and record the gap
-          this.status.gaps.push({ fromSlot: resumeFrom, toSlot: this.status.lastSlot, atMs: Date.now() });
-          this.h.onGap(resumeFrom, this.status.lastSlot);
-          this.status.lastSlot = 0;
-          continue;
-        }
+        failed = true;
+        if (resumeFrom !== null && /from.?slot|not available|too old|retention|out.?of.?range/i.test(String(err))) this.replayFailures = MAX_REPLAY_FAILURES;
+      }
+      if (resumeFrom !== null && (failed || !gotData) && ++this.replayFailures >= MAX_REPLAY_FAILURES) {
+        // the replay cannot be served: continue live and record the gap
+        this.status.gaps.push({ fromSlot: resumeFrom, toSlot: this.status.lastSlot, atMs: Date.now() });
+        this.h.onGap(resumeFrom, this.status.lastSlot);
+        this.status.lastSlot = 0;
+        this.replayFailures = 0;
+        continue;
       }
       if (this.stopped) break;
       this.status.reconnects++;
@@ -168,8 +191,9 @@ export class YellowstoneIngest {
     }
   }
 
-  private async runOnce(fromSlot: number | null): Promise<void> {
-    const mod: Any = await import("@triton-one/yellowstone-grpc");
+  /** One subscription until it ends; resolves true if any message arrived. */
+  private async runOnce(fromSlot: number | null): Promise<boolean> {
+    const mod: Any = await (this.opts.loadClientModule ?? (() => import("@triton-one/yellowstone-grpc")))();
     const Client = mod.default?.default ?? mod.default;
     const { CommitmentLevel, SlotStatus } = mod;
     const client = new Client(this.opts.endpoint, this.opts.xToken, {
@@ -210,14 +234,21 @@ export class YellowstoneIngest {
       stream.write({ ...request, fromSlot: undefined, ping: { id: pingId++ } }, () => undefined);
     }, this.opts.pingIntervalSec() * 1000);
 
+    let gotData = false;
     await new Promise<void>((resolve, reject) => {
       stream.on("data", (u: Any) => {
         const now = Date.now();
         this.status.lastMessageAtMs = now;
         this.attempt = 0;
+        gotData = true;
+        this.replayFailures = 0;
         if (u.transaction) {
           const tx = toRawTx(u.transaction, now);
           if (!tx) return;
+          if (this.replayUntilSlot !== null) {
+            if (tx.slot <= this.replayUntilSlot) tx.replayed = true;
+            else this.replayUntilSlot = null; // past the replay: live from here
+          }
           if (tx.slot > this.status.lastSlot) this.status.lastSlot = tx.slot;
           if (!this.seen.add(tx.signature)) {
             this.status.duplicatesSkipped++;
@@ -236,6 +267,7 @@ export class YellowstoneIngest {
       stream.on("close", () => resolve());
     });
     this.status.connected = false;
+    return gotData;
   }
 }
 

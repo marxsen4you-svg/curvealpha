@@ -33,6 +33,11 @@ export interface RawTx {
   failed: boolean;
   /** Signer of the transaction (fee payer). */
   feePayer: string;
+  /**
+   * Delivered as part of a from_slot replay after a reconnect: its receive
+   * time is the replay's, not its block's, so timing measured from it is wrong.
+   */
+  replayed?: boolean;
 }
 
 export interface CreateEvt {

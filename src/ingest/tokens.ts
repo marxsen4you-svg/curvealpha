@@ -270,9 +270,13 @@ export class TokenBook {
     if (rec) rec.gap = true;
   }
 
-  /** Every mint active since a slot is marked as having a gap. */
-  markGapSince(slot: number): void {
-    for (const rec of this.tokens.values()) if (rec.lastSlot >= slot || rec.createdSlot >= slot) rec.gap = true;
+  /**
+   * Events from `_slot` on were lost. Every live token may have traded in that
+   * window, including ones that were quiet just before it, so all of them
+   * are marked as having a gap.
+   */
+  markGapSince(_slot: number): void {
+    for (const rec of this.tokens.values()) rec.gap = true;
   }
 
   onConfirmedSlot(slot: number): void {

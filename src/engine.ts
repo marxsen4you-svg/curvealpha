@@ -151,9 +151,12 @@ export class Engine {
     this.counters.txs++;
     for (const e of parsePumpEvents(tx)) {
       this.counters.events++;
+      // replayed history: the state is right, the timing is not, so the mint is never scored
+      if (tx.replayed && e.kind !== "create") this.tokens.markGap(e.mint);
       if (e.kind === "create") {
         this.counters.creates++;
         this.tokens.onCreate(e);
+        if (tx.replayed) this.tokens.markGap(e.mint);
         this.names.add(`${e.name} ${e.symbol}`, e.receivedAtMs);
       } else if (e.kind === "trade") {
         this.counters.trades++;
