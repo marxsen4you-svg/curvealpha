@@ -205,7 +205,7 @@ async function run(): Promise<void> {
     {
       onTx: (tx) => engine.ingest(tx),
       onDeadSlot: (slot) => engine.tokens.onDeadSlot(slot),
-      onConfirmedSlot: (slot) => engine.tokens.onConfirmedSlot(slot),
+      onConfirmedSlot: (slot, bank) => engine.tokens.onConfirmedSlot(slot, bank),
       onGap: (from) => engine.tokens.markGapSince(from),
     },
   );

@@ -9,6 +9,7 @@ import { describe, expect, it } from "vitest";
 import { pumpSdk } from "../src/chain/sdk.js";
 import { DISC } from "../src/chain/events.js";
 import {
+  checkConsensus,
   checkDispatch,
   checkEventDiscriminators,
   checkNode,
@@ -63,6 +64,24 @@ describe("protocol state", () => {
     const huge = { feeTiers: [{ marketCapLamportsThreshold: 0n, lpFeeBps: 0n, protocolFeeBps: 900n, creatorFeeBps: 300n }] };
     expect(checkProtocolState(MAINNET_GLOBAL, huge).status).toBe("fail");
     expect(checkProtocolState({ ...MAINNET_GLOBAL, initialVirtualTokenReserves: 0n }, curveSchedule()).status).toBe("fail");
+  });
+});
+
+describe("consensus (getAgGenesisCert, Agave 4.3)", () => {
+  it("reports TowerBFT while the RPC answers null and Alpenglow once it returns a certificate", () => {
+    const tower = checkConsensus({ result: null });
+    expect(tower.status).toBe("pass");
+    expect(tower.detail).toMatch(/TowerBFT/);
+    const ag = checkConsensus({ result: { slot: 459_653_000 } });
+    expect(ag.status).toBe("pass");
+    expect(ag.detail).toMatch(/Alpenglow active/);
+  });
+
+  it("warns, never passes silently, when the RPC cannot say (method missing before Agave 4.3, or any error)", () => {
+    const old = checkConsensus({ error: { code: -32601, message: "Method not found" } });
+    expect(old.status).toBe("warn");
+    expect(old.detail).toMatch(/Agave 4\.3/);
+    expect(checkConsensus({ error: { code: -32000, message: "boom" } }).status).toBe("warn");
   });
 });
 

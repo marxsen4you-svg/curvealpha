@@ -20,9 +20,15 @@
  * Transactions delivered by a replay carry the replay's receive time, not
  * their block's, so they are tagged (RawTx.replayed) and the engine never
  * scores the mints they touch.
+ *
+ * Under Alpenglow a slot can have several candidate banks, and processed
+ * updates include banks the leader later abandons. Transactions and slot
+ * confirmations carry their bank id, scoped to the connection that delivered
+ * it (ids are not comparable across connections), so the token book can drop
+ * what an abandoned bank contained.
  */
 import bs58 from "bs58";
-import type { RawTx } from "../chain/events.js";
+import type { BankRef, RawTx } from "../chain/events.js";
 import { PUMP_PROGRAM } from "../chain/events.js";
 
 export interface IngestStatus {
@@ -38,7 +44,7 @@ export interface IngestStatus {
 export interface IngestHandlers {
   onTx(tx: RawTx): void;
   onDeadSlot(slot: number): void;
-  onConfirmedSlot(slot: number): void;
+  onConfirmedSlot(slot: number, bank?: BankRef): void;
   /** A replay window could not be served; mints active in it have a data gap. */
   onGap(fromSlot: number, toSlot: number): void;
 }
@@ -56,8 +62,44 @@ export interface IngestOptions {
 
 /** Replay attempts that fail, for any reason, before continuing live and recording a gap. */
 export const MAX_REPLAY_FAILURES = 3;
-/** Slots of slack on the estimated end of a replay (slot times vary around 400 ms). */
+/** Slots of slack on the estimated end of a replay. */
 const REPLAY_SLACK_SLOTS = 50;
+/** Slot time assumed before the stream has measured one; short, so history is never taken for live. */
+const UNMEASURED_SLOT_MS = 150;
+/** The measured slot time is shortened by this factor for the same reason. */
+const SLOT_RATE_MARGIN = 0.8;
+
+/**
+ * Slot rate measured from the stream. Slot time is not a constant: mainnet
+ * averaged 216 ms on 19 October 2026, not the long-assumed 400 ms.
+ */
+export class SlotRate {
+  private anchor: { slot: number; atMs: number } | null = null;
+  msPerSlot: number | null = null;
+
+  observe(slot: number, atMs: number): void {
+    if (!this.anchor || slot < this.anchor.slot) {
+      this.anchor = { slot, atMs };
+      return;
+    }
+    const dt = atMs - this.anchor.atMs;
+    if (dt >= 30_000 && slot > this.anchor.slot) {
+      this.msPerSlot = dt / (slot - this.anchor.slot);
+      this.anchor = { slot, atMs };
+    }
+  }
+}
+
+/**
+ * Last slot a from_slot replay can contain: the slot the chain reached while
+ * the connection was down. Estimated on the fast side, so the cost of a
+ * wrong estimate is a few live transactions treated as history (their mints
+ * are not scored), never history treated as live.
+ */
+export function replayEndSlot(lastSlot: number, outageMs: number, msPerSlot: number | null): number {
+  const ms = msPerSlot === null ? UNMEASURED_SLOT_MS : msPerSlot * SLOT_RATE_MARGIN;
+  return lastSlot + Math.ceil(outageMs / ms) + REPLAY_SLACK_SLOTS;
+}
 
 /** Fixed-size set of recent signatures for replay de-duplication. */
 export class RecentSet {
@@ -87,8 +129,11 @@ export function backoffMs(attempt: number, base: number, max: number, rand = Mat
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Any = any;
 
+/** A bank id from an update, scoped to its connection; none when the provider does not send one. */
+const bankOf = (bankId: unknown, conn: number): BankRef | undefined => (bankId ? { conn, id: String(bankId) } : undefined);
+
 /** Convert a Yellowstone SubscribeUpdateTransaction into the neutral RawTx. */
-export function toRawTx(update: Any, receivedAtMs: number): RawTx | null {
+export function toRawTx(update: Any, receivedAtMs: number, conn = 0): RawTx | null {
   const info = update?.transaction;
   const tx = info?.transaction;
   const meta = info?.meta;
@@ -103,7 +148,9 @@ export function toRawTx(update: Any, receivedAtMs: number): RawTx | null {
   for (const group of meta.innerInstructions ?? []) {
     for (const ix of group.instructions ?? []) inner.push({ programIdIndex: ix.programIdIndex, data: ix.data });
   }
+  const bank = bankOf(update.bankId, conn);
   return {
+    ...(bank ? { bank } : {}),
     signature: bs58.encode(info.signature),
     slot: Number(update.slot),
     receivedAtMs,
@@ -134,6 +181,9 @@ export class YellowstoneIngest {
   private attempt = 0;
   private pingTimer: NodeJS.Timeout | null = null;
   private replayFailures = 0;
+  /** Number of the current connection; bank ids are only comparable within one. */
+  private conn = 0;
+  private rate = new SlotRate();
   /** While set, transactions at or below this slot are replayed history, not live. */
   private replayUntilSlot: number | null = null;
 
@@ -165,8 +215,7 @@ export class YellowstoneIngest {
     while (!this.stopped) {
       const resumeFrom = this.status.lastSlot > 0 ? Math.max(0, this.status.lastSlot - this.opts.fromSlotRewind()) : null;
       // the replay re-sends history up to about the live tip: estimate it from the outage length
-      this.replayUntilSlot =
-        resumeFrom === null ? null : this.status.lastSlot + Math.ceil((Date.now() - this.status.lastMessageAtMs) / 400) + REPLAY_SLACK_SLOTS;
+      this.replayUntilSlot = resumeFrom === null ? null : replayEndSlot(this.status.lastSlot, Date.now() - this.status.lastMessageAtMs, this.rate.msPerSlot);
       let failed = false;
       let gotData = false;
       try {
@@ -202,6 +251,7 @@ export class YellowstoneIngest {
     await client.connect();
     const stream = await client.subscribe();
     this.stream = stream;
+    const conn = ++this.conn;
     const request: Any = {
       accounts: {},
       slots: { slots: { filterByCommitment: false, interslotUpdates: false } },
@@ -243,12 +293,13 @@ export class YellowstoneIngest {
         gotData = true;
         this.replayFailures = 0;
         if (u.transaction) {
-          const tx = toRawTx(u.transaction, now);
+          const tx = toRawTx(u.transaction, now, conn);
           if (!tx) return;
           if (this.replayUntilSlot !== null) {
             if (tx.slot <= this.replayUntilSlot) tx.replayed = true;
             else this.replayUntilSlot = null; // past the replay: live from here
           }
+          if (!tx.replayed) this.rate.observe(tx.slot, now);
           if (tx.slot > this.status.lastSlot) this.status.lastSlot = tx.slot;
           if (!this.seen.add(tx.signature)) {
             this.status.duplicatesSkipped++;
@@ -258,8 +309,9 @@ export class YellowstoneIngest {
           this.h.onTx(tx);
         } else if (u.slot) {
           const slot = Number(u.slot.slot);
+          if (this.replayUntilSlot === null) this.rate.observe(slot, now);
           if (u.slot.status === SlotStatus.SLOT_DEAD) this.h.onDeadSlot(slot);
-          else if (u.slot.status === SlotStatus.SLOT_CONFIRMED) this.h.onConfirmedSlot(slot);
+          else if (u.slot.status === SlotStatus.SLOT_CONFIRMED) this.h.onConfirmedSlot(slot, bankOf(u.slot.bankId, conn));
         }
       });
       stream.on("error", (e: unknown) => reject(e));

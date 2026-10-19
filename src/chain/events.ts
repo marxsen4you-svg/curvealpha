@@ -18,6 +18,16 @@ export const DISC = {
 };
 export const PUMP_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P";
 
+/**
+ * The candidate bank of a slot an update came from. Under Alpenglow a slot
+ * can have several; the id is a counter local to one gRPC connection, so it
+ * is only comparable with another from the same connection (`conn`).
+ */
+export interface BankRef {
+  conn: number;
+  id: string;
+}
+
 /** Transport-neutral transaction, filled by the Yellowstone adapter or by tests. */
 export interface RawTx {
   signature: string;
@@ -38,12 +48,15 @@ export interface RawTx {
    * time is the replay's, not its block's, so timing measured from it is wrong.
    */
   replayed?: boolean;
+  /** Absent when the provider sends no bank id (TowerBFT, or a Yellowstone build without it). */
+  bank?: BankRef;
 }
 
 export interface CreateEvt {
   kind: "create";
   signature: string;
   slot: number;
+  bank?: BankRef;
   receivedAtMs: number;
   mint: string;
   bondingCurve: string;
@@ -68,6 +81,7 @@ export interface TradeEvt {
   kind: "trade";
   signature: string;
   slot: number;
+  bank?: BankRef;
   /** Position of the event inside the transaction, for stable ordering. */
   seq: number;
   receivedAtMs: number;
@@ -94,6 +108,7 @@ export interface CompleteEvt {
   kind: "complete";
   signature: string;
   slot: number;
+  bank?: BankRef;
   receivedAtMs: number;
   mint: string;
   bondingCurve: string;
@@ -117,6 +132,7 @@ function decode(tx: RawTx, payload: Buffer, seq: number): PumpEvt | null {
         kind: "trade",
         signature: tx.signature,
         slot: tx.slot,
+        ...(tx.bank ? { bank: tx.bank } : {}),
         seq,
         receivedAtMs: tx.receivedAtMs,
         mint: e.mint.toBase58(),
@@ -144,6 +160,7 @@ function decode(tx: RawTx, payload: Buffer, seq: number): PumpEvt | null {
         kind: "create",
         signature: tx.signature,
         slot: tx.slot,
+        ...(tx.bank ? { bank: tx.bank } : {}),
         receivedAtMs: tx.receivedAtMs,
         mint: e.mint.toBase58(),
         bondingCurve: e.bondingCurve.toBase58(),
@@ -170,6 +187,7 @@ function decode(tx: RawTx, payload: Buffer, seq: number): PumpEvt | null {
         kind: "complete",
         signature: tx.signature,
         slot: tx.slot,
+        ...(tx.bank ? { bank: tx.bank } : {}),
         receivedAtMs: tx.receivedAtMs,
         mint: e.mint.toBase58(),
         bondingCurve: e.bondingCurve.toBase58(),

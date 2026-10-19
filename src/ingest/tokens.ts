@@ -4,8 +4,20 @@
  * error accumulates), its trade tape, holder balances, the creator's
  * position, and per-wallet cost basis for realized P&L.
  */
-import type { CreateEvt, TradeEvt } from "../chain/events.js";
+import type { BankRef, CreateEvt, TradeEvt } from "../chain/events.js";
 import type { CurveState } from "../math/curve.js";
+
+/** Dead and confirmed slots remembered for events the queue hands over late (about 15 minutes at 216 ms slots). */
+const SLOT_MEMORY = 4096;
+
+/** Two banks of one slot, seen on the same connection, that are not the same bank. */
+const rivals = (a: BankRef | undefined, b: BankRef | undefined) => a !== undefined && b !== undefined && a.conn === b.conn && a.id !== b.id;
+
+function remember<K>(seen: Map<K, unknown> | Set<K>, key: K, value?: unknown): void {
+  if (seen instanceof Map) seen.set(key, value);
+  else seen.add(key);
+  if (seen.size > SLOT_MEMORY) seen.delete(seen.keys().next().value as K);
+}
 
 export interface TradeLite {
   slot: number;
@@ -65,7 +77,11 @@ const MAX_TRADES = 6000;
 
 export class TokenBook {
   readonly tokens = new Map<string, TokenRecord>();
-  private slotIndex = new Map<number, Set<string>>();
+  /** Unconfirmed slot -> bank key -> mints with an event in that bank. */
+  private slotIndex = new Map<number, Map<string, { bank: BankRef | undefined; mints: Set<string> }>>();
+  /** Recently confirmed slots and the bank each was confirmed through (undefined when the provider sent none). */
+  private confirmedSlots = new Map<number, BankRef | undefined>();
+  private deadSlots = new Set<number>();
 
   constructor(private onRealized: (r: RealizedPnl) => void = () => undefined) {}
 
@@ -116,7 +132,7 @@ export class TokenBook {
       scoredHorizons: new Set(),
     };
     this.tokens.set(e.mint, rec);
-    this.index(e.slot, e.mint);
+    this.index(e.slot, e.mint, e.bank);
     return rec;
   }
 
@@ -138,7 +154,7 @@ export class TokenBook {
       preBal: e.userPreBalance,
     };
     if (rec.trades.length < MAX_TRADES) rec.trades.push(t);
-    this.index(e.slot, e.mint);
+    this.index(e.slot, e.mint, e.bank);
 
     // the newest event by (slot, seq) defines the curve
     if (e.slot > rec.lastSlot || (e.slot === rec.lastSlot && e.seq > rec.lastSeq)) {
@@ -254,15 +270,14 @@ export class TokenBook {
     if (rec && rec.completedAtMs === null) rec.completedAtMs = atMs;
   }
 
-  /** A fork dropped this slot: every token with an event in it is tainted. */
+  /** A fork dropped this slot: every token with an event in it is tainted, including events processed later. */
   onDeadSlot(slot: number): string[] {
-    const mints = [...(this.slotIndex.get(slot) ?? [])];
-    for (const m of mints) {
-      const rec = this.tokens.get(m);
-      if (rec) rec.tainted = true;
-    }
+    const mints = new Set<string>();
+    for (const b of this.slotIndex.get(slot)?.values() ?? []) for (const m of b.mints) mints.add(m);
+    for (const m of mints) this.taint(m);
     this.slotIndex.delete(slot);
-    return mints;
+    remember(this.deadSlots, slot);
+    return [...mints];
   }
 
   markGap(mint: string): void {
@@ -279,8 +294,14 @@ export class TokenBook {
     for (const rec of this.tokens.values()) rec.gap = true;
   }
 
-  onConfirmedSlot(slot: number): void {
-    // anything confirmed can no longer be forked away
+  /**
+   * Anything confirmed can no longer be forked away. Under Alpenglow a slot
+   * can be confirmed through a different bank than some of its events came
+   * from: that bank was abandoned and its events never happened.
+   */
+  onConfirmedSlot(slot: number, bank?: BankRef): void {
+    for (const b of this.slotIndex.get(slot)?.values() ?? []) if (rivals(b.bank, bank)) for (const m of b.mints) this.taint(m);
+    remember(this.confirmedSlots, slot, bank);
     for (const s of this.slotIndex.keys()) if (s <= slot) this.slotIndex.delete(s);
   }
 
@@ -290,10 +311,24 @@ export class TokenBook {
     return rec;
   }
 
-  private index(slot: number, mint: string): void {
+  private index(slot: number, mint: string, bank: BankRef | undefined): void {
+    // the queue can hand over an event after its slot was already settled
+    if (this.deadSlots.has(slot)) return this.taint(mint);
+    if (this.confirmedSlots.has(slot)) {
+      if (rivals(bank, this.confirmedSlots.get(slot))) this.taint(mint);
+      return;
+    }
     let s = this.slotIndex.get(slot);
-    if (!s) this.slotIndex.set(slot, (s = new Set()));
-    s.add(mint);
+    if (!s) this.slotIndex.set(slot, (s = new Map()));
+    const key = bank ? `${bank.conn}:${bank.id}` : "";
+    let b = s.get(key);
+    if (!b) s.set(key, (b = { bank, mints: new Set() }));
+    b.mints.add(mint);
+  }
+
+  private taint(mint: string): void {
+    const rec = this.tokens.get(mint);
+    if (rec) rec.tainted = true;
   }
 
   /** Creator's current token balance (bought minus sold, never negative). */

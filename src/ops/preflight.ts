@@ -89,6 +89,33 @@ export function checkProtocolState(global: GlobalParams, schedule: FeeSchedule):
   return res("protocol state", "pass", `${schedule.feeTiers.length} fee tier(s), first ${t0.protocolFeeBps} bps protocol + ${t0.creatorFeeBps} bps creator + ${t0.lpFeeBps} bps lp`);
 }
 
+/**
+ * Which consensus the cluster runs, from getAgGenesisCert (Agave 4.3): null
+ * under TowerBFT, a certificate once Alpenglow has taken over (mainnet epoch
+ * 1064, about 21 October 2026 15:00 UTC). Informational: either is safe to
+ * start under, but an operator should know which one the run is on.
+ */
+export function checkConsensus(reply: { result?: unknown; error?: { code: number; message: string } }): CheckResult {
+  if (reply.error) {
+    return res(
+      "consensus",
+      "warn",
+      reply.error.code === -32601
+        ? "the RPC does not implement getAgGenesisCert (needs Agave 4.3): cannot tell whether Alpenglow is active"
+        : `could not read consensus: ${reply.error.message}`,
+    );
+  }
+  return reply.result == null
+    ? res("consensus", "pass", "TowerBFT: Alpenglow has not taken over yet (mainnet epoch 1064)")
+    : res("consensus", "pass", "Alpenglow active: confirmed now equals finalized, and the feed must carry bank ids for abandoned banks to be dropped");
+}
+
+/** Raw JSON-RPC call for a method web3.js 1.x does not wrap. */
+async function rpcCall(conn: Connection, method: string): Promise<{ result?: unknown; error?: { code: number; message: string } }> {
+  const r = await fetch(conn.rpcEndpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method }) });
+  return (await r.json()) as { result?: unknown; error?: { code: number; message: string } };
+}
+
 export function checkTipFloor(floor: TipFloor | null, nowMs: number, mode: Mode): CheckResult {
   const fresh = floor !== null && nowMs - floor.atMs <= 60_000;
   if (fresh) return res("jito tip floor", "pass", `p50 ${floor.p50} lamports, ema50 ${floor.ema50}`);
@@ -148,6 +175,11 @@ export async function runPreflight(c: PreflightContext): Promise<{ ok: boolean; 
     }
   };
   await attempt("rpc", async () => res("rpc", "pass", `reachable, slot ${await c.conn.getSlot("confirmed")}`));
+  try {
+    out.push(checkConsensus(await rpcCall(c.conn, "getAgGenesisCert")));
+  } catch (e) {
+    out.push(res("consensus", "warn", `could not read consensus: ${e instanceof Error ? e.message : String(e)}`));
+  }
   await attempt("protocol state", async () => {
     const s = await fetchProtocolState(c.conn);
     return checkProtocolState(s.global, s.schedule);

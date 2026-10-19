@@ -15,7 +15,7 @@
 import { describe, expect, it } from "vitest";
 import { EventEmitter } from "node:events";
 import { Keypair } from "@solana/web3.js";
-import { YellowstoneIngest } from "../src/ingest/yellowstone.js";
+import { replayEndSlot, SlotRate, YellowstoneIngest } from "../src/ingest/yellowstone.js";
 import { TokenBook } from "../src/ingest/tokens.js";
 import type { RawTx } from "../src/chain/events.js";
 import { createEventBytes, rawTx } from "./helpers/events.js";
@@ -136,6 +136,29 @@ describe("ingest reconnection", () => {
     } finally {
       ing.stop();
     }
+  });
+});
+
+describe("where a replay ends", () => {
+  // Mainnet averaged 216 ms per slot on 19 October 2026 (getRecentPerformanceSamples),
+  // not the 400 ms the estimate assumed: a 60 s outage covers about 278 slots, and
+  // the old estimate (150 + 50 slack) let the replay's last ~78 slots through as live.
+  it("covers every slot the outage spans at the measured slot rate", () => {
+    const end = replayEndSlot(1_000, 60_000, 216);
+    expect(end).toBeGreaterThanOrEqual(1_000 + Math.ceil(60_000 / 216));
+  });
+
+  it("errs towards treating history as replayed when the rate is not measured yet", () => {
+    expect(replayEndSlot(1_000, 60_000, null)).toBeGreaterThanOrEqual(1_000 + Math.ceil(60_000 / 200));
+  });
+
+  it("measures the slot rate from the stream over at least 30 s", () => {
+    const r = new SlotRate();
+    r.observe(100, 0);
+    r.observe(150, 10_000);
+    expect(r.msPerSlot).toBeNull();
+    r.observe(239, 30_000);
+    expect(r.msPerSlot).toBeCloseTo(30_000 / 139, 3);
   });
 });
 
