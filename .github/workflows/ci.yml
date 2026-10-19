@@ -1,0 +1,46 @@
+# Every push and pull request: typecheck, build, the full TypeScript suite
+# (including the differential proof against @pump-fun/pump-sdk and the
+# market simulation), the Rust implementation against SDK-generated vectors,
+# and a dependency audit that fails on critical findings.
+#
+# No secrets are configured or needed: every test runs offline against
+# scripted RPC, block engine and gRPC clients, and nothing is signed with a
+# funded key or sent to a network.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  typescript:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # the oldest supported Node (node:sqlite) and the current LTS
+        node: ["22.13", "24"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci --no-fund
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      - name: Production dependencies have no critical advisories
+        run: npm audit --omit=dev --audit-level=critical
+
+  rust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: curve-core against SDK-generated vectors
+        run: cargo test --manifest-path crates/curve-core/Cargo.toml

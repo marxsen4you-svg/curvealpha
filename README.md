@@ -122,14 +122,18 @@ Create a `.env` file (see `.env.example`):
 | `CURVEALPHA_X_BEARER` | X API bearer token, optional. |
 | `CURVEALPHA_DATA_DIR` | Where the database and `params.json` live (default `data`). |
 | `CURVEALPHA_DASHBOARD_PORT` | Dashboard port (default 7420, always bound to 127.0.0.1). |
+| `CURVEALPHA_LOG_FORMAT` | `json` for JSON lines; anything else gives timestamped text lines (journald friendly). |
 
-Secrets are read only from the environment and are never logged, stored, or shown on the dashboard.
+Secrets are read only from the environment and are never stored or shown on the dashboard. Every log line goes through one logger that masks the configured secrets, credentials in URLs (`user:pass@host`) and key-like query parameters (`api-key=`, `x-token=`, ...).
 
 ### Run
 
 ```bash
-node --env-file=.env --import tsx src/cli.ts run     # or: npm run build && node --env-file=.env dist/cli.js run
+node --env-file=.env --import tsx src/cli.ts preflight   # read-only checks; nothing is signed or sent
+node --env-file=.env --import tsx src/cli.ts run         # or: npm run build && node --env-file=.env dist/cli.js run
 ```
+
+`run` performs the same preflight first and refuses to start on any failed check (see [Operations](#operations)).
 
 Open `http://127.0.0.1:7420`. On a remote machine, reach it with `ssh -L 7420:127.0.0.1:7420 yourhost`.
 
@@ -150,6 +154,24 @@ node --env-file=.env --import tsx src/cli.ts run --i-accept-the-risk
 ```
 
 Live and paper keep separate databases and separate survival state.
+
+---
+
+## Operations
+
+| Need | Command or behaviour |
+|---|---|
+| Is it safe to start? | `curvealpha preflight`: Node version, settings, database integrity, parameters, the trading key (live), RPC, consensus (TowerBFT or Alpenglow), decoded protocol state, event discriminators against the SDK's IDL, the deployed pump and PumpSwap programs against the versions this build was verified against, a read-only simulation that the program dispatches the v3 buy and sell, and the Jito tip floor. Exit 0 only if nothing failed. |
+| The pump program was upgraded | Preflight warns in paper and **fails in live** until you have run the tests and paper mode against it and acknowledged it: `curvealpha preflight --accept-program-upgrade` (recorded in the decision log). |
+| Is it healthy? | `curvealpha status` (exit 0 ok, 1 degraded, 2 down) or `GET /api/health` on the dashboard. Degraded means one of: feed disconnected or silent over 30 s, trading halted, open positions without a readable curve, failed database writes, a stale tip floor (entries refused), event loop p99 over 200 ms. Down means no heartbeat for 15 s. Each problem is logged once as `ALERT` when it appears and once when it clears. |
+| Stop | `SIGINT` or `SIGTERM` (`systemctl stop curvealpha`): no new entries, then up to 30 s for orders and exits in flight to settle, then state is flushed. |
+| Restart | Open positions are restored from the database with their exit state and resume being managed. In live mode each one is checked against the wallet's actual token balance, so a sell that landed but was never recorded is reconciled and a position with nothing left is closed. |
+| Back up | `curvealpha backup [file]`: a consistent online copy (`VACUUM INTO`) while the engine runs, integrity-checked. |
+| Restore | `curvealpha restore <file>` with the engine stopped. Refuses a corrupt backup or one from a newer schema; the replaced database is kept beside it. |
+
+### Alpenglow (Solana consensus upgrade, mainnet epoch 1064, about 21 October 2026)
+
+Solana lists Alpenglow as a breaking change. After it takes over, a slot can have more than one candidate bank, and a `processed` stream (which CurveAlpha uses for speed) includes transactions from banks the leader later abandons. CurveAlpha keeps each event's bank id and taints every mint with an event in an abandoned bank, exactly as it does for a dead slot, so phantom trades never reach scoring. That needs a Yellowstone provider whose server sends bank ids (Yellowstone v16 for Agave 4.3); ask yours before running live after the switch. Do not hold live positions across the switch itself, and run `curvealpha preflight` afterwards: its `consensus` line says which consensus the cluster is on. Source: [solana.com/upgrades/alpenglow](https://solana.com/upgrades/alpenglow) (read 19 October 2026).
 
 ---
 
@@ -183,8 +205,15 @@ Live and paper keep separate databases and separate survival state.
 | Survival Engine behaviour | Kelly matches the closed form when fixed costs are zero; fixed costs remove the stake at small bankrolls; negative expectation samples are never approved; caps, breakers, mode transitions, restart persistence and exact replay are all tested. |
 | Pipeline | A synthetic market (rugs with bundled freshly funded buyers and creator dumps, fading duds, accelerating runners) is streamed through the real engine; it checks that decisions replay identically, that the paper ledger balances to the lamport, that the risk cap holds on every entry and that scoring stays inside its deadline. |
 | Instruction construction | Buy and sell instructions decode back, through the program IDL, to the exact amounts and discriminators. |
+| Risk is held for orders in flight | Concurrent entries cannot exceed the position limit or the risk budget while earlier orders are still unconfirmed (`test/risk.reservation.test.ts`). |
+| Restarts lose nothing | A crash with an open position, a restart on the same database, and the exits close it; the paper ledger balances to the lamport across the crash (`test/engine.restart.test.ts`). |
+| Live fills come from the chain | Fills are read from the confirmed transaction, re-read while the RPC catches up, never assumed; "did not land" is declared only after the blockhash expired (`test/live.reconcile.test.ts`, scripted RPC and block engine, throwaway key, no network). |
+| Faults are contained | A thrown buy halts entries, a thrown sell is retried, an unhandled rejection halts and is recorded, a failing database write degrades instead of crashing (`test/engine.faults.test.ts`, `test/store.robustness.test.ts`, `test/faults.process.test.ts`). |
+| Ingest never stalls or lies about time | A replay that keeps failing is abandoned after three attempts and the gap recorded; replayed history is never scored; abandoned Alpenglow banks and late events from dead slots taint their mints (`test/ingest.reconnect.test.ts`, `test/ingest.banks.test.ts`). |
+| Evaluation has no look-ahead | Kelly paths size each entry only from outcomes closed before it opened; the weight search split is purged; intervals treat the mint as the unit (`test/evaluate.methodology.test.ts`). |
+| Operations fail closed | Preflight, health, backup and restore are tested on literal inputs and real databases (`test/ops.*.test.ts`). |
 
-Not proven offline: live landing rates, real tip levels, gRPC provider behaviour, PumpSwap exits on real pools, and whether any factor predicts real outcomes. Paper mode and `curvealpha evaluate` are how you find that out.
+Not proven offline: live landing rates, real tip levels, gRPC provider behaviour (including bank ids after Alpenglow), PumpSwap exits on real pools, and whether any factor predicts real outcomes. Paper mode and `curvealpha evaluate` are how you find that out.
 
 ---
 
@@ -251,7 +280,11 @@ Every decision is reproducible from what is stored.
 
 | Command | What it does |
 |---|---|
-| `curvealpha run` | Start the engine and dashboard. |
+| `curvealpha run` | Preflight, then start the engine and dashboard. |
+| `curvealpha preflight [--accept-program-upgrade]` | Every start-up check, read-only. Exit 1 on any failure. |
+| `curvealpha status` | Health from the running engine's heartbeat, with open positions. Exit 0 ok, 1 degraded, 2 down. |
+| `curvealpha backup [file]` | Online, integrity-checked copy of the database (default `data/backups/`). |
+| `curvealpha restore <file>` | Put a backup in place (engine stopped; the replaced database is kept). |
 | `curvealpha costs [--tip L] [--cu-price M]` | Fixed cost viability table. |
 | `curvealpha evaluate [--days N] [--apply-weights]` | Offline evaluation report. |
 | `curvealpha replay <id>` | Replay a sizing decision. |
@@ -265,7 +298,10 @@ npm run typecheck
 npm test                         # all TypeScript suites (the market simulation takes a few minutes)
 CURVE_DIFF_CASES=60000 npx vitest run test/curve.diff.test.ts
 npm run vectors && npm run test:rust
+npx tsx scripts/bench.ts         # repeatable benchmarks on fixed seeds
 ```
+
+CI (`.github/workflows/ci.yml`) runs the typecheck, build, the full suite on Node 22.13 and 24, the Rust vectors and a dependency audit that fails on critical advisories, on every push. No test touches a network or a funded key.
 
 ## License
 
