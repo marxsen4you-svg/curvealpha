@@ -56,6 +56,8 @@ export class PositionManager {
   readonly positions = new Map<number, Position>();
   readonly closed: Position[] = [];
   private nextLocalId = 1;
+  /** Orders and exits in flight, so a shutdown can wait for their outcome. */
+  private inflight = new Set<Promise<unknown>>();
 
   constructor(
     private store: Store,
@@ -83,7 +85,34 @@ export class PositionManager {
     return BASE_FEE_PER_SIGNATURE + priorityFee(BigInt(e.cuPriceMicroLamports), BigInt(e.paperSellCuLimit)) + tip;
   }
 
-  async open(req: OpenRequest): Promise<Position | null> {
+  private track<T>(p: Promise<T>): Promise<T> {
+    this.inflight.add(p);
+    p.finally(() => this.inflight.delete(p)).catch(() => undefined);
+    return p;
+  }
+
+  /** Wait for every order and exit in flight, up to timeoutMs; true if all settled. */
+  async settle(timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.inflight.size > 0) {
+      const left = deadline - Date.now();
+      if (left <= 0) return false;
+      let timer: NodeJS.Timeout | undefined;
+      const timedOut = await Promise.race([
+        Promise.allSettled([...this.inflight]).then(() => false),
+        new Promise<boolean>((r) => (timer = setTimeout(() => r(true), left))),
+      ]);
+      clearTimeout(timer);
+      if (timedOut) return false;
+    }
+    return true;
+  }
+
+  open(req: OpenRequest): Promise<Position | null> {
+    return this.track(this.openNow(req));
+  }
+
+  private async openNow(req: OpenRequest): Promise<Position | null> {
     const p = this.params();
     const c = this.ctx();
     const quote = simulateV3Buy(c.global, c.schedule, req.rec.curve.tokenTotalSupply, req.rec.curve, req.stakeLamports);
@@ -182,7 +211,7 @@ export class PositionManager {
     const action = evaluateExit(pos.state, rec, c, p, this.clock.now(), this.exitFixedPerTx(exitTip.tipLamports));
     if (!action) return;
     pos.pending = true;
-    void this.exit(pos, action).finally(() => {
+    void this.track(this.exit(pos, action)).finally(() => {
       pos.pending = false;
     });
   }

@@ -25,6 +25,7 @@ import type { TipOracle } from "../exec/tips.js";
 import type { Store } from "../store/db.js";
 import type { EvaluationReport } from "../meta/evaluate.js";
 import { evaluateAsync } from "../meta/evaluateAsync.js";
+import { assessHealth } from "../ops/health.js";
 import { ratioToNumber } from "../math/curve.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -176,6 +177,10 @@ export function startDashboard(d: DashboardDeps): { url: string; close: () => vo
     try {
       if (req.method === "GET" && url.pathname === "/") return send(res, 200, html, "text/html; charset=utf-8");
       if (req.method === "GET" && url.pathname === "/api/state") return send(res, 200, stateJson());
+      if (req.method === "GET" && url.pathname === "/api/health") {
+        const hb = d.engine.heartbeat();
+        return send(res, 200, json({ ...assessHealth(hb, d.engine.now()), heartbeat: hb }));
+      }
       if (req.method === "GET" && url.pathname === "/api/events") {
         res.writeHead(200, { ...SECURITY_HEADERS, "content-type": "text/event-stream", connection: "keep-alive" });
         const push = () => res.write(`data: ${stateJson()}\n\n`);

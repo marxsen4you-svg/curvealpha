@@ -26,6 +26,7 @@ import { PositionManager } from "./exec/positions.js";
 import { chooseTip, type TipOracle } from "./exec/tips.js";
 import type { Store } from "./store/db.js";
 import type { Clock } from "./util/clock.js";
+import { HealthWatcher, type Heartbeat } from "./ops/health.js";
 
 export interface MarketState {
   global: GlobalParams;
@@ -135,6 +136,31 @@ export class Engine {
 
   /** Hook for the ingest layer to apply real flow control. */
   onPressure: (pause: boolean) => void = () => undefined;
+
+  /** What the engine cannot see itself (the feed, the event loop); set by the process that runs it. */
+  statusProbe: () => Pick<Heartbeat, "ingest" | "eventLoopP99Ms"> = () => ({ ingest: null, eventLoopP99Ms: null });
+
+  /** Logs a health problem when it appears and when it clears. */
+  private watcher = new HealthWatcher((level, m) => (level === "ALERT" ? console.warn : console.log)(`${level}: ${m}`));
+
+  now(): number {
+    return this.d.clock.now();
+  }
+
+  /** The engine's state for health checks: persisted every equity mark, served at /api/health. */
+  heartbeat(): Heartbeat {
+    const snap = this.survival.snapshot(this.d.clock.now());
+    return {
+      atMs: this.d.clock.now(),
+      mode: this.d.settings.mode,
+      ...this.statusProbe(),
+      queue: { depth: this.queue.stats.depth, dropped: this.queue.stats.dropped },
+      survival: { mode: snap.mode, haltReason: snap.haltReason },
+      positions: { open: this.positions.positions.size, unmanaged: this.positions.unmanaged().length },
+      store: { writeErrors: this.d.store.writeErrors },
+      tipFloorAtMs: this.d.tips.floor?.atMs ?? null,
+    };
+  }
 
   /** Entry point for every transaction (from gRPC, a recording, or a test). */
   ingest(tx: RawTx): void {
@@ -393,6 +419,9 @@ export class Engine {
     this.survival.updateEquity(Number(equity), now);
     const snap = this.survival.snapshot(now);
     this.d.store.kvSet(`survival:${this.d.settings.mode}`, JSON.stringify(snap));
+    const hb = this.heartbeat();
+    this.d.store.kvSet(`heartbeat:${this.d.settings.mode}`, JSON.stringify(hb));
+    this.watcher.observe(hb, now);
     this.d.store.defer(() =>
       this.d.store.run("INSERT INTO equity(ts_ms, equity_lamports, cash_lamports, mode) VALUES (?, ?, ?, ?)", now, equity, this.cashCache, this.d.settings.mode),
     );
@@ -452,6 +481,11 @@ export class Engine {
         console.error("event processing error", e);
       }
     }
+  }
+
+  /** Wait for orders and exits in flight (a shutdown calls this after stop()); true if all settled in time. */
+  settle(timeoutMs: number): Promise<boolean> {
+    return this.positions.settle(timeoutMs);
   }
 
   stop(): void {

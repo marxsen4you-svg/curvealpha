@@ -8,14 +8,21 @@
  *   curvealpha replay <id>       re-derive a logged sizing decision and check it is identical
  *   curvealpha decisions         list recent decisions
  *   curvealpha check-params      validate data/params.json
+ *   curvealpha preflight         every start-up check, read-only; exits non-zero on any failure
+ *                                (--accept-program-upgrade records the deployed pump programs as reviewed)
+ *   curvealpha status            health of the running engine from its heartbeat (exit 0 ok, 1 degraded, 2 down)
+ *   curvealpha backup [file]     consistent online copy of the database, integrity-checked
+ *   curvealpha restore <file>    put a backup in place (engine stopped; the replaced database is kept)
  */
-import { join } from "node:path";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { monitorEventLoopDelay } from "node:perf_hooks";
 import { Connection } from "@solana/web3.js";
-import { loadSettings, settingsProblems } from "./config/settings.js";
+import { loadSettings, settingsProblems, type Settings } from "./config/settings.js";
 import { ParamsManager } from "./config/manager.js";
-import { countParams } from "./config/params.js";
+import { countParams, resolveParams } from "./config/params.js";
 import { Store } from "./store/db.js";
-import { curveReader, fetchAtaRent, fetchProtocolState } from "./chain/accounts.js";
+import { PUMP_AMM_PROGRAM_ID, PUMP_PROGRAM_ID, curveReader, fetchAtaRent, fetchProtocolState } from "./chain/accounts.js";
 import { pumpSdk, pumpSwapSdk } from "./chain/sdk.js";
 import { scheduleFromSdk } from "./chain/state.js";
 import { Engine, type MarketState } from "./engine.js";
@@ -31,6 +38,10 @@ import { replayDecision } from "./meta/replay.js";
 import { systemClock } from "./util/clock.js";
 import { viabilityTable } from "./risk/viability.js";
 import { installFaultHandlers } from "./util/faults.js";
+import { formatPreflight, programDeploySlot, runPreflight, type CheckResult } from "./ops/preflight.js";
+import { assessHealth, type Heartbeat } from "./ops/health.js";
+import { backupDatabase, restoreDatabase } from "./ops/backup.js";
+import { createLogger, routeConsole } from "./util/log.js";
 
 const args = process.argv.slice(2);
 const cmd = args[0] ?? "run";
@@ -47,22 +58,80 @@ async function fetchMarket(conn: Connection): Promise<MarketState> {
   return { global: proto.global, schedule: proto.schedule, ammSchedule, ataRent: await fetchAtaRent(conn), updatedAtMs: Date.now() };
 }
 
+const dbPath = (s: Settings) => join(s.dataDir, `curvealpha-${s.mode}.sqlite`);
+
+/** Local checks (settings, database, parameters, key file), then the read-only remote preflight. */
+async function preflight(settings: Settings): Promise<{ ok: boolean; results: CheckResult[] }> {
+  const local: CheckResult[] = [];
+  const problems = settingsProblems(settings);
+  local.push(
+    problems.length
+      ? { name: "settings", status: "fail", detail: problems.join("; ") }
+      : { name: "settings", status: "pass", detail: `${settings.mode} mode, data in ${settings.dataDir}` },
+  );
+  let store: Store | null = null;
+  try {
+    store = new Store(dbPath(settings));
+    const qc = store.get<{ quick_check: string }>("PRAGMA quick_check")?.quick_check;
+    local.push({ name: "database", status: qc === "ok" ? "pass" : "fail", detail: qc === "ok" ? `${dbPath(settings)} intact` : `integrity check: ${qc}` });
+  } catch (e) {
+    local.push({ name: "database", status: "fail", detail: e instanceof Error ? e.message : String(e) });
+  }
+  const paramsPath = join(settings.dataDir, "params.json");
+  try {
+    if (existsSync(paramsPath)) resolveParams(JSON.parse(readFileSync(paramsPath, "utf8")));
+    local.push({ name: "parameters", status: "pass", detail: existsSync(paramsPath) ? `${paramsPath} valid` : "defaults will be written on start" });
+  } catch (e) {
+    local.push({ name: "parameters", status: "fail", detail: `${paramsPath}: ${e instanceof Error ? e.message : String(e)}` });
+  }
+  if (settings.mode === "live" && settings.keypairPath) {
+    try {
+      const { keypair, warnings } = loadKeypair(settings.keypairPath);
+      local.push({ name: "trading key", status: warnings.length ? "warn" : "pass", detail: warnings.length ? warnings.join("; ") : `wallet ${keypair.publicKey.toBase58()}` });
+    } catch (e) {
+      local.push({ name: "trading key", status: "fail", detail: e instanceof Error ? e.message : String(e) });
+    }
+  }
+  const conn = new Connection(settings.rpcUrl, "confirmed");
+  if (flag("accept-program-upgrade") && store) {
+    for (const [name, id] of [["pump", PUMP_PROGRAM_ID], ["pumpswap", PUMP_AMM_PROGRAM_ID]] as const) {
+      const slot = await programDeploySlot(conn, id);
+      store.kvSet(`protocol:ack:${name}`, String(slot));
+      store.logDecision(Date.now(), null, "operator", null, `${name} program deployed at slot ${slot} acknowledged as reviewed`, { program: name, slot });
+    }
+  }
+  const s = store;
+  const result = await runPreflight({
+    mode: settings.mode,
+    conn,
+    nowMs: Date.now(),
+    acknowledgedSlot: (program) => {
+      const v = s?.kvGet(`protocol:ack:${program}`);
+      return v ? Number(v) : null;
+    },
+    tipFloor: () => new TipOracle().refresh(),
+    local,
+  });
+  store?.close();
+  return result;
+}
+
 async function run(): Promise<void> {
   const settings = loadSettings();
-  const problems = settingsProblems(settings);
-  if (problems.length) {
-    console.error("CurveAlpha cannot start:\n" + problems.map((p) => `  - ${p}`).join("\n"));
-    process.exit(1);
-  }
+  // every line the engine writes is timestamped, levelled and stripped of secrets
+  routeConsole(createLogger({ secrets: [settings.grpcToken, settings.xBearerToken, settings.jitoAuthUuid], json: process.env.CURVEALPHA_LOG_FORMAT === "json" }));
+  console.log(`CurveAlpha V5, ${settings.mode.toUpperCase()} mode. Preflight...`);
+  const pf = await preflight(settings);
+  console.log(formatPreflight(pf));
+  if (!pf.ok) process.exit(1);
   if (settings.mode === "live" && !flag("i-accept-the-risk")) {
     console.error("Live mode trades real SOL. Re-run with --i-accept-the-risk once you have read the README's risk section and run paper mode first.");
     process.exit(1);
   }
-  const store = new Store(join(settings.dataDir, `curvealpha-${settings.mode}.sqlite`));
+  const store = new Store(dbPath(settings));
   const params = new ParamsManager(join(settings.dataDir, "params.json"), store);
   params.watch();
   const conn = new Connection(settings.rpcUrl, "confirmed");
-  console.log(`CurveAlpha V5, ${settings.mode.toUpperCase()} mode. Reading pump Global and FeeConfig from chain...`);
   let market: MarketState;
   try {
     market = await fetchMarket(conn);
@@ -141,6 +210,17 @@ async function run(): Promise<void> {
     },
   );
   engine.onPressure = (pause) => ingest.setPaused(pause);
+  const loop = monitorEventLoopDelay({ resolution: 20 });
+  loop.enable();
+  engine.statusProbe = () => {
+    const p99 = loop.percentile(99) / 1e6;
+    loop.reset();
+    const st = ingest.status;
+    return {
+      ingest: { connected: st.connected, lastMessageAtMs: st.lastMessageAtMs, lastSlot: st.lastSlot, reconnects: st.reconnects, gaps: st.gaps.length },
+      eventLoopP99Ms: Number.isFinite(p99) ? p99 : null,
+    };
+  };
   installFaultHandlers({
     proc: process,
     halt: (reason) => engine.survival.halt(reason),
@@ -167,25 +247,54 @@ async function run(): Promise<void> {
   const dash = startDashboard({ engine, params, settings, ingest, tips, store });
   console.log(`Dashboard: ${dash.url}  (${countParams()} tunable parameters in ${join(settings.dataDir, "params.json")})`);
 
-  const shutdown = () => {
-    console.log("Stopping: flushing state...");
+  let stopping = false;
+  const shutdown = async () => {
+    if (stopping) return;
+    stopping = true;
+    console.log("Stopping: no new entries; waiting up to 30 s for orders and exits in flight...");
     clearInterval(refresh);
-    if (paper) store.kvSet("paper_cash", paper.cash.toString());
     ingest.stop();
-    tips.stop();
     engine.stop();
+    const settled = await engine.settle(30_000);
+    console.log(settled ? "Everything in flight settled." : "Some orders or exits were still in flight; they are reconciled against the wallet on the next start.");
+    if (paper) store.kvSet("paper_cash", paper.cash.toString());
+    store.kvSet(`survival:${settings.mode}`, JSON.stringify(engine.survivalSnapshot()));
+    store.kvSet(`heartbeat:${settings.mode}`, JSON.stringify({ ...engine.heartbeat(), atMs: 0 })); // stopped, not stale
+    tips.stop();
     dash.close();
     params.stop();
     store.close();
     process.exit(0);
   };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  const onSignal = () => void shutdown().catch((e) => {
+    console.error("shutdown failed", e);
+    process.exit(1);
+  });
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
 }
 
 async function main(): Promise<void> {
   const settings = loadSettings();
   if (cmd === "run") return run();
+  if (cmd === "preflight") {
+    const pf = await preflight(settings);
+    console.log(formatPreflight(pf));
+    process.exitCode = pf.ok ? 0 : 1;
+    return;
+  }
+  if (cmd === "restore") {
+    const file = args[1];
+    if (!file) {
+      console.error("Usage: curvealpha restore <backup file>");
+      process.exitCode = 1;
+      return;
+    }
+    const r = restoreDatabase(file, dbPath(settings), Date.now());
+    console.log(r.ok ? `Restored ${file} to ${dbPath(settings)}${r.asidePath ? `; the previous database is at ${r.asidePath}` : ""}.` : `Restore refused: ${r.error}`);
+    process.exitCode = r.ok ? 0 : 1;
+    return;
+  }
   if (cmd === "costs") {
     let floor: TipFloor | null = null;
     const tipArg = opt("tip");
@@ -198,7 +307,32 @@ async function main(): Promise<void> {
     console.log(viabilityTable(tip, BigInt(opt("cu-price") ?? 1000)));
     return;
   }
-  const store = new Store(join(settings.dataDir, `curvealpha-${settings.mode}.sqlite`));
+  const store = new Store(dbPath(settings));
+  if (cmd === "status") {
+    const raw = store.kvGet(`heartbeat:${settings.mode}`);
+    const hb = raw ? (JSON.parse(raw) as Heartbeat) : null;
+    const h = assessHealth(hb && hb.atMs > 0 ? hb : null, Date.now());
+    console.log(`${settings.mode} engine: ${h.status.toUpperCase()}${hb && hb.atMs === 0 ? " (stopped cleanly)" : ""}`);
+    for (const pr of h.problems) console.log(`  - ${pr}`);
+    if (hb) {
+      console.log(`  survival ${hb.survival.mode}, ${hb.positions.open} open position(s), queue depth ${hb.queue.depth}, ${hb.queue.dropped} dropped`);
+      if (hb.ingest) console.log(`  feed slot ${hb.ingest.lastSlot}, ${hb.ingest.reconnects} reconnects, ${hb.ingest.gaps} gaps`);
+    }
+    const open = store.all<{ id: number; mint: string; tokens_left: string; opened_ms: number }>("SELECT id, mint, tokens_left, opened_ms FROM positions WHERE status = 'open' AND mode = ?", settings.mode);
+    for (const o of open) console.log(`  position ${o.id} ${o.mint} ${o.tokens_left} tokens, opened ${new Date(o.opened_ms).toISOString()}`);
+    process.exitCode = h.status === "ok" ? 0 : h.status === "degraded" ? 1 : 2;
+    store.close();
+    return;
+  }
+  if (cmd === "backup") {
+    const dest = args[1] ?? join(settings.dataDir, "backups", `curvealpha-${settings.mode}-${new Date().toISOString().replace(/[:.]/g, "-")}.sqlite`);
+    mkdirSync(dirname(dest), { recursive: true });
+    const r = backupDatabase(store, dest);
+    console.log(r.ok ? `Backup written: ${r.path} (${(r.bytes / 1e6).toFixed(1)} MB, integrity ok)` : `Backup FAILED: ${r.error}`);
+    process.exitCode = r.ok ? 0 : 1;
+    store.close();
+    return;
+  }
   if (cmd === "evaluate") {
     const pm = new ParamsManager(join(settings.dataDir, "params.json"), store);
     const r = evaluate(store, pm.get(), Date.now(), Number(opt("days") ?? 14), Number(opt("tip") ?? 100_000));
@@ -230,7 +364,7 @@ async function main(): Promise<void> {
       process.exitCode = 1;
     }
   } else {
-    console.error(`Unknown command "${cmd}". Commands: run, costs, evaluate, replay <id>, decisions, check-params`);
+    console.error(`Unknown command "${cmd}". Commands: run, preflight, status, backup [file], restore <file>, costs, evaluate, replay <id>, decisions, check-params`);
     process.exitCode = 1;
   }
   store.close();
